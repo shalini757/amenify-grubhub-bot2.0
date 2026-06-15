@@ -2,6 +2,7 @@
 
 require('dotenv').config();
 
+const http = require('http');
 const { logger } = require('./logger');
 const sheetClient = require('./sheet/sheetClient');
 const claudeClient = require('./claude/claudeClient');
@@ -97,6 +98,41 @@ async function cmdOrder() {
 // Process at most one queued order: claim a row, run Phase 1-7, write back.
 // Returns an exit code (0=ok, 1=failure, 2=nothing to do). Never throws —
 // errors are written to the sheet and logged so the loop can keep running.
+// Pre-flight: is the debug Chrome actually reachable?
+//
+// When BROWSER_CDP_URL is set the bot attaches to a Chrome the human launched
+// (`npm run chrome`). If that Chrome isn't running, Playwright's connectOverCDP
+// hangs for the full 120s timeout and THEN throws — and by that point we've
+// already locked a row, so it gets marked failed. That's the #1 operational
+// pain (WORKFLOW.md 4.1/8): a down browser burns every row instead of pausing.
+//
+// This does a cheap (3s) HTTP probe of Chrome's DevTools endpoint BEFORE any
+// row is locked. Chrome always serves GET /json/version on the debug port.
+// Returns { ok, reason } — ok:false means "pause the queue, touch no rows".
+function preflightChromeReachable() {
+  const cdpUrl = process.env.BROWSER_CDP_URL;
+  if (!cdpUrl) return Promise.resolve({ ok: true }); // launch-own-Chrome mode — nothing to probe
+  const probeUrl = cdpUrl.replace(/\/+$/, '') + '/json/version';
+  return new Promise((resolve) => {
+    const req = http.get(probeUrl, { timeout: 3000 }, (res) => {
+      // Drain and discard the body; any 2xx means DevTools is alive.
+      res.resume();
+      if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+        resolve({ ok: true });
+      } else {
+        resolve({ ok: false, reason: `CDP endpoint returned HTTP ${res.statusCode}` });
+      }
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      resolve({ ok: false, reason: `no response from ${probeUrl} within 3s` });
+    });
+    req.on('error', (err) => {
+      resolve({ ok: false, reason: `${err.code || err.message} connecting to ${probeUrl}` });
+    });
+  });
+}
+
 async function processOneOrder() {
   const DRY_RUN = (process.env.DRY_RUN || 'true').toLowerCase() === 'true';
   const CONFIDENCE_THRESHOLD = parseFloat(process.env.CONFIDENCE_THRESHOLD || '0.85');
@@ -111,6 +147,18 @@ async function processOneOrder() {
   let lockedRow = null;
 
   try {
+    // Pre-flight 1: don't lock a row if the debug Chrome isn't even up. Returns
+    // code 3 (SESSION_EXPIRED handling) so the drain/run loop PAUSES 60s for the
+    // human to start Chrome, instead of locking + failing the row.
+    const reach = await preflightChromeReachable();
+    if (!reach.ok) {
+      logger.warn(
+        { reason: reach.reason, cdpUrl: process.env.BROWSER_CDP_URL },
+        'PRE-FLIGHT: debug Chrome not reachable — pausing queue, NOT processing any row. Start it with `npm run chrome` and sign in.',
+      );
+      return 3;
+    }
+
     const orders = await sheetClient.getQueuedOrders();
     logger.info({ count: orders.length, dryRun: DRY_RUN }, 'queued orders fetched');
     if (!orders.length) {
@@ -155,9 +203,11 @@ async function processOneOrder() {
       return;
     }
 
-    await sheetClient.lockRow(order._rowNumber, order.id);
-    lockedRow = order._rowNumber;
-
+    // Pre-flight 2: attach to Chrome and HARD-assert signed-in BEFORE locking
+    // the row. If the Chrome session is signed out, assertSignedIn throws
+    // SESSION_EXPIRED → caught below → returns code 3 (pause). Because the row
+    // isn't locked yet, lockedRow stays null, so the catch block does NOT mark
+    // it failed — the row is left untouched and retried after you sign in.
     const account = pickAccount('auto');
     ctx = await launchContext(account.id);
     browser = ctx.browser;
@@ -177,6 +227,12 @@ async function processOneOrder() {
     // here instead of walking into the wrong UI and typing addresses into
     // the hero search input.
     await cart.assertSignedIn(page);
+
+    // Chrome is up AND signed in — only NOW claim the row. Everything below this
+    // line is a genuine per-order outcome (review/failure), not a "browser not
+    // ready" situation, so it's safe to lock and write back to the sheet.
+    await sheetClient.lockRow(order._rowNumber, order.id);
+    lockedRow = order._rowNumber;
 
     // Per-order clean slate. Between rows the SAME Grubhub session can carry
     // over the PREVIOUS restaurant's bound address + cart in localStorage
