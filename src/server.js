@@ -30,7 +30,7 @@ const { logger } = require('./logger');
 function startServer({ processOneOrder }) {
   const port = parseInt(process.env.TRIGGER_PORT || '8787', 10);
   const secret = process.env.TRIGGER_SECRET || '';
-  const pollMs = Math.max(5000, parseInt(process.env.POLL_INTERVAL_MS || '30000', 10));
+  const pollMs = Math.max(5000, parseInt(process.env.POLL_INTERVAL_MS || '300000', 10));
 
   // --- diagnostics state ---
   const startedAt = Date.now();
