@@ -596,15 +596,22 @@ async function processOneOrder() {
     // the order shows the resident, not the bot account. Special instructions
     // come from the parsed notes.
     try {
-      await cart.fillCheckoutContact(page, {
-        // Prefer the resident's name/phone from the SHEET ROW columns
-        // (first_name/last_name/cell_phone) so the order shows the resident,
-        // not the bot account. Fall back to anything parsed from the notes.
-        firstName: parsed.customerFirstName || parsed.residentFirstName || order.first_name,
-        lastName: parsed.customerLastName || parsed.residentLastName || order.last_name,
-        phone: parsed.customerPhone || parsed.bookingPhone || order.cell_phone,
+      // The SHEET ROW columns (first_name/last_name/cell_phone) are the source
+      // of truth for the resident — they MUST win over anything parsed from the
+      // notes or pre-filled by the bot's Grubhub account, otherwise the order
+      // shows the bot account's name/phone. Only fall back to parsed values when
+      // a sheet column is blank.
+      const contact = {
+        firstName: order.first_name || parsed.customerFirstName || parsed.residentFirstName,
+        lastName: order.last_name || parsed.customerLastName || parsed.residentLastName,
+        phone: order.cell_phone || parsed.customerPhone || parsed.bookingPhone,
         specialInstructions: parsed.specialInstructions || parsed.driverNotes,
-      });
+      };
+      logger.info(
+        { firstName: contact.firstName, lastName: contact.lastName, phone: contact.phone, source: 'sheet-first' },
+        'filling checkout contact from sheet row',
+      );
+      await cart.fillCheckoutContact(page, contact);
     } catch (e) {
       logger.warn({ err: e.message }, 'fillCheckoutContact threw (continuing — fields may already be set)');
     }
@@ -777,13 +784,13 @@ async function processOneOrder() {
 // (your laptop) — Ctrl+C to stop.
 //
 // Sleep policy:
-//   - empty queue → sleep POLL_INTERVAL_MS (default 30s) then poll again
+//   - empty queue → sleep POLL_INTERVAL_MS (default 5 min) then poll again
 //   - failure or success → sleep 2s then poll again (don't punish next row)
 //   - SESSION_EXPIRED (Chrome got signed out) → sleep 60s. Avoids burning
 //     through the whole queue marking every row failed before the human can
 //     re-sign in. Hold for the user to act.
 async function cmdRun() {
-  const pollMs = Math.max(5000, parseInt(process.env.POLL_INTERVAL_MS || '30000', 10));
+  const pollMs = Math.max(5000, parseInt(process.env.POLL_INTERVAL_MS || '300000', 10));
   logger.info({ pollMs }, 'starting run loop (Ctrl+C to stop)');
   // eslint-disable-next-line no-constant-condition
   while (true) {

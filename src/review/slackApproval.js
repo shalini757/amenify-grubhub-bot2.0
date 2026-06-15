@@ -23,7 +23,7 @@ function channelId() {
 //   2. PUT the bytes to upload_url
 //   3. files.completeUploadExternal with the file_id (and optional channel)
 // Returns { ok, fileId, permalink } or { ok: false, error }.
-async function uploadScreenshot(localPath, { title } = {}) {
+async function uploadScreenshot(localPath, { title, channelId: chId, threadTs, initialComment } = {}) {
   if (!localPath || !fs.existsSync(localPath)) {
     return { ok: false, error: 'screenshot file not found' };
   }
@@ -49,7 +49,12 @@ async function uploadScreenshot(localPath, { title } = {}) {
     },
     body: JSON.stringify({
       files: [{ id: file_id, title: title || filename }],
-      channel_id: channelId(),
+      // Must be a real channel ID (Cxxxx), NOT a channel name. Callers pass the
+      // ID resolved from chat.postMessage's response so a name-configured
+      // SLACK_APPROVAL_CHANNEL doesn't silently drop the image.
+      channel_id: chId || channelId(),
+      ...(threadTs ? { thread_ts: threadTs } : {}),
+      ...(initialComment ? { initial_comment: initialComment } : {}),
     }),
   });
   const completeJson = await completeRes.json().catch(() => ({}));
@@ -63,17 +68,11 @@ async function uploadScreenshot(localPath, { title } = {}) {
 async function sendCheckoutApproval({ orderId, restaurantName, total, currency = '$', screenshotPath, rowNumber }) {
   if (!orderId) throw new Error('sendCheckoutApproval: orderId is required');
 
-  let screenshotPermalink = null;
-  if (screenshotPath) {
-    const up = await uploadScreenshot(screenshotPath, { title: `Order ${orderId} review` });
-    if (up.ok) {
-      screenshotPermalink = up.permalink;
-      logger.info({ orderId, fileId: up.fileId }, 'screenshot uploaded to Slack');
-    } else {
-      logger.warn({ orderId, error: up.error }, 'screenshot upload failed — sending message without image');
-    }
-  }
-
+  // NOTE: the screenshot is uploaded AFTER the message is posted (below), so we
+  // can attach it into the message's thread using the channel ID that
+  // chat.postMessage resolves. files.completeUploadExternal needs a real
+  // channel ID — uploading before we have it (when SLACK_APPROVAL_CHANNEL is a
+  // channel *name*) is what made the image silently never arrive.
   const blocks = [
     {
       type: 'header',
@@ -88,9 +87,6 @@ async function sendCheckoutApproval({ orderId, restaurantName, total, currency =
         { type: 'mrkdwn', text: `*Order ID:*\n${orderId}` },
       ],
     },
-    ...(screenshotPermalink
-      ? [{ type: 'section', text: { type: 'mrkdwn', text: `<${screenshotPermalink}|Open checkout screenshot>` } }]
-      : []),
     {
       type: 'section',
       text: {
@@ -119,9 +115,35 @@ async function sendCheckoutApproval({ orderId, restaurantName, total, currency =
   const json = await res.json().catch(() => ({}));
   if (!json.ok) {
     logger.warn({ orderId, error: json.error, raw: json }, 'chat.postMessage failed');
-    return { ok: false, error: json.error || 'unknown', screenshotPermalink };
+    return { ok: false, error: json.error || 'unknown' };
   }
   logger.info({ orderId, channel: json.channel, ts: json.ts }, 'approval message posted to Slack');
+
+  // Now upload the checkout screenshot INTO this message's thread, using the
+  // channel ID Slack just resolved (json.channel). This is the reliable path:
+  // files.completeUploadExternal requires a channel ID, and threading it keeps
+  // the image directly under the approval message reviewers react to.
+  let screenshotPermalink = null;
+  if (screenshotPath) {
+    const up = await uploadScreenshot(screenshotPath, {
+      title: `Order ${orderId} — final checkout review`,
+      channelId: json.channel,
+      threadTs: json.ts,
+      initialComment: 'Final checkout review — react :white_check_mark: / :x: on the message above to approve or reject.',
+    });
+    if (up.ok) {
+      screenshotPermalink = up.permalink;
+      logger.info({ orderId, fileId: up.fileId }, 'checkout screenshot posted to Slack thread');
+    } else {
+      logger.warn({ orderId, error: up.error }, 'screenshot upload failed — approval message sent without image');
+      // Tell reviewers explicitly so a missing image isn't mistaken for a bug.
+      await postFollowUp({
+        channel: json.channel,
+        ts: json.ts,
+        text: `:warning: Could not attach the checkout screenshot (${up.error}). Approve/reject based on the order details above.`,
+      }).catch(() => {});
+    }
+  }
 
   // Seed the message with bot reactions so reviewers can one-click the emoji
   // they want instead of typing the picker. The poll filter ignores reactions
