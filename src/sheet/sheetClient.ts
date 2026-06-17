@@ -1,13 +1,33 @@
-'use strict';
+import fs from 'fs';
+import path from 'path';
+import { google, sheets_v4 } from 'googleapis';
+import { GoogleAuth } from 'google-auth-library';
+import { logger } from '../logger';
 
-const fs = require('fs');
-const path = require('path');
-const { google } = require('googleapis');
-const { GoogleAuth } = require('google-auth-library');
-const { logger } = require('../logger');
+// A row returned by getQueuedOrders: the per-row metadata plus every sheet
+// column read into the object. The sheet columns are always strings (empty
+// string when blank); _rowNumber is a number. The index signature covers any
+// other header columns present in the sheet.
+export type OrderRow = {
+  _rowNumber: number;
+  id: string;
+  script: string;
+  state: string;
+  notes: string;
+  bot_status: string;
+  first_name: string;
+  last_name: string;
+  cell_phone: string;
+  address: string;
+  unit: string;
+  extended_provider_mealme_order_product_list: string;
+  extended_provider_mealme_order_store: string;
+  email: string;
+  [key: string]: string | number | undefined;
+};
 
 // Real sheet schema — 20 columns, in order.
-const COLUMNS = [
+const COLUMNS: string[] = [
   'script',                                       // A — workflow owner ("in progress by ...")
   'id',                                           // B — order ID
   'since',                                        // C — created timestamp
@@ -35,18 +55,18 @@ const COLUMNS = [
 
 // Bot-owned columns: auto-created in the header if absent, so they are
 // excluded from the "required pre-existing column" check.
-const BOT_COLUMNS = ['bot_status', 'bot_notes', 'bot_internal'];
-const REQUIRED_COLUMNS = COLUMNS.filter((c) => !BOT_COLUMNS.includes(c));
+const BOT_COLUMNS: string[] = ['bot_status', 'bot_notes', 'bot_internal'];
+const REQUIRED_COLUMNS: string[] = COLUMNS.filter((c) => !BOT_COLUMNS.includes(c));
 
-const BOT_OWNER = process.env.BOT_OWNER_LABEL || 'in progress by Bot';
-const COMPLETED_STATE = process.env.COMPLETED_STATE || 'Completed';
-const READY_STATES = (process.env.READY_STATES || '')
+const BOT_OWNER: string = process.env.BOT_OWNER_LABEL || 'in progress by Bot';
+const COMPLETED_STATE: string = process.env.COMPLETED_STATE || 'Completed';
+const READY_STATES: string[] = (process.env.READY_STATES || '')
   .split(',')
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 const GRUBHUB_URL_RE = /grubhub\.com\/restaurant\//i;
 
-function colLetter(idx) {
+function colLetter(idx: number): string {
   let n = idx + 1;
   let s = '';
   while (n > 0) {
@@ -57,7 +77,7 @@ function colLetter(idx) {
   return s;
 }
 
-function buildAuth() {
+function buildAuth(): GoogleAuth {
   const credsPath = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
   if (!credsPath) throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON env var is required');
   const absolute = path.isAbsolute(credsPath) ? credsPath : path.resolve(process.cwd(), credsPath);
@@ -70,8 +90,8 @@ function buildAuth() {
   });
 }
 
-let _sheets;
-function sheets() {
+let _sheets: sheets_v4.Sheets | undefined;
+function sheets(): sheets_v4.Sheets {
   if (!_sheets) {
     const auth = buildAuth();
     _sheets = google.sheets({ version: 'v4', auth });
@@ -79,53 +99,58 @@ function sheets() {
   return _sheets;
 }
 
-function spreadsheetId() {
+function spreadsheetId(): string {
   const id = process.env.GOOGLE_SHEET_ID;
   if (!id) throw new Error('GOOGLE_SHEET_ID env var is required');
   return id;
 }
 
-function tabName() {
+function tabName(): string {
   return process.env.SHEET_TAB_NAME || 'Orders';
 }
 
-function headerRange() {
+function headerRange(): string {
   const tab = tabName();
   const last = colLetter(COLUMNS.length - 1);
   return `${tab}!A1:${last}1`;
 }
 
-function dataRange() {
+function dataRange(): string {
   const tab = tabName();
   const last = colLetter(COLUMNS.length - 1);
   return `${tab}!A2:${last}`;
 }
 
-async function readHeader() {
+async function readHeader(): Promise<string[]> {
   const res = await sheets().spreadsheets.values.get({
     spreadsheetId: spreadsheetId(),
     range: headerRange(),
   });
-  const row = (res.data.values && res.data.values[0]) || [];
-  return row.map((h) => String(h || '').trim());
+  const row = res.data.values?.[0] ?? [];
+  return row.map((h) => String(h ?? '').trim());
 }
 
-function rowsToObjects(header, rows, startRowNumber) {
+function rowsToObjects(
+  header: string[],
+  rows: unknown[][],
+  startRowNumber: number,
+): OrderRow[] {
   return rows.map((r, i) => {
-    const obj = { _rowNumber: startRowNumber + i };
+    const obj = { _rowNumber: startRowNumber + i } as OrderRow;
     header.forEach((h, idx) => {
-      obj[h] = r[idx] != null ? String(r[idx]) : '';
+      const cell = r[idx];
+      obj[h] = cell != null ? String(cell) : '';
     });
     return obj;
   });
 }
 
-async function verifyConnection() {
+async function verifyConnection(): Promise<{ title: string; tab: string; header: string[] }> {
   const id = spreadsheetId();
   const meta = await sheets().spreadsheets.get({ spreadsheetId: id });
   const tab = tabName();
-  const sheet = (meta.data.sheets || []).find(
-    (s) => s.properties && s.properties.title === tab,
+  const sheet = (meta.data.sheets ?? []).find(
+    (s) => s.properties?.title === tab,
   );
   if (!sheet) throw new Error(`Tab "${tab}" not found in spreadsheet ${id}`);
   let header = await readHeader();
@@ -150,41 +175,42 @@ async function verifyConnection() {
     logger.info({ added: newHeaders }, 'bot columns added to sheet header');
     header = await readHeader();
   }
+  const title = meta.data.properties?.title ?? '';
   logger.info(
-    { sheetId: id, tab, title: meta.data.properties.title, columns: header.length },
+    { sheetId: id, tab, title, columns: header.length },
     'sheet verified',
   );
-  return { title: meta.data.properties.title, tab, header };
+  return { title, tab, header };
 }
 
-function isReadyState(state) {
-  const s = (state || '').trim().toLowerCase();
+function isReadyState(state: string | undefined): boolean {
+  const s = (state ?? '').trim().toLowerCase();
   if (READY_STATES.length === 0) return s === '';
   return READY_STATES.includes(s);
 }
 
-async function getQueuedOrders() {
+async function getQueuedOrders(): Promise<OrderRow[]> {
   const header = await readHeader();
   const res = await sheets().spreadsheets.values.get({
     spreadsheetId: spreadsheetId(),
     range: dataRange(),
   });
-  const rows = res.data.values || [];
+  const rows = res.data.values ?? [];
   const objects = rowsToObjects(header, rows, 2);
   return objects.filter((r) => {
     if (!r.id) return false;
     // Read-only guards on shared columns (the bot never writes these):
-    if ((r.script || '').trim() !== '') return false;   // claimed by a human
+    if ((r.script ?? '').trim() !== '') return false;   // claimed by a human
     if (!isReadyState(r.state)) return false;            // human "ready" signal
-    if (!GRUBHUB_URL_RE.test(r.notes || '')) return false;
+    if (!GRUBHUB_URL_RE.test(r.notes ?? '')) return false;
     // Bot-owned claim: a non-empty bot_status means the bot already locked,
     // completed, failed, or flagged this row — skip it.
-    if ((r.bot_status || '').trim() !== '') return false;
+    if ((r.bot_status ?? '').trim() !== '') return false;
     return true;
   });
 }
 
-async function readCell(rowNumber, columnName) {
+async function readCell(rowNumber: number, columnName: string): Promise<string> {
   const header = await readHeader();
   const idx = header.indexOf(columnName);
   if (idx === -1) return '';
@@ -193,12 +219,16 @@ async function readCell(rowNumber, columnName) {
     spreadsheetId: spreadsheetId(),
     range: cell,
   });
-  return (res.data.values && res.data.values[0] && res.data.values[0][0]) || '';
+  const val = res.data.values?.[0]?.[0];
+  return val != null ? String(val) : '';
 }
 
-async function updateRow(rowNumber, patch) {
+async function updateRow(
+  rowNumber: number,
+  patch: Record<string, unknown>,
+): Promise<void> {
   const header = await readHeader();
-  const updates = [];
+  const updates: sheets_v4.Schema$ValueRange[] = [];
   for (const [key, value] of Object.entries(patch)) {
     const idx = header.indexOf(key);
     if (idx === -1) continue;
@@ -218,7 +248,7 @@ async function updateRow(rowNumber, patch) {
 // re-reading the cell after a brief delay; if a second writer landed in
 // between, last-writer-wins and we abort. For single-process operation
 // this is exact; for multi-process it is best-effort.
-async function lockRow(rowNumber, orderId) {
+async function lockRow(rowNumber: number, orderId: string): Promise<string> {
   const header = await readHeader();
   const statusIdx = header.indexOf('bot_status');
   if (statusIdx === -1) throw new Error('bot_status column not found in sheet header');
@@ -227,22 +257,18 @@ async function lockRow(rowNumber, orderId) {
     spreadsheetId: spreadsheetId(),
     range: cell,
   });
-  const val = ((cur.data.values && cur.data.values[0] && cur.data.values[0][0]) || '')
-    .toString()
-    .trim();
+  const val = String(cur.data.values?.[0]?.[0] ?? '').trim();
   if (val !== '') {
     throw new Error(`Row ${rowNumber} already claimed by "${val}"`);
   }
   const nonce = `Locked ${BOT_OWNER} [${process.pid}/${Date.now()}]`;
   await updateRow(rowNumber, { bot_status: nonce });
-  await new Promise((r) => setTimeout(r, 1500));
+  await new Promise<void>((r) => setTimeout(r, 1500));
   const after = await sheets().spreadsheets.values.get({
     spreadsheetId: spreadsheetId(),
     range: cell,
   });
-  const finalVal = ((after.data.values && after.data.values[0] && after.data.values[0][0]) || '')
-    .toString()
-    .trim();
+  const finalVal = String(after.data.values?.[0]?.[0] ?? '').trim();
   if (finalVal !== nonce) {
     throw new Error(`Row ${rowNumber} lock lost: another writer claimed it as "${finalVal}"`);
   }
@@ -253,7 +279,12 @@ async function lockRow(rowNumber, orderId) {
 
 // Append a timestamped line to a bot-owned column, capping total length so it
 // can't grow without bound (keeps the most recent entries).
-async function appendBotColumn(rowNumber, column, note, cap = 3000) {
+async function appendBotColumn(
+  rowNumber: number,
+  column: string,
+  note: string,
+  cap = 3000,
+): Promise<void> {
   const header = await readHeader();
   if (!header.includes(column)) return;
   const existing = await readCell(rowNumber, column);
@@ -265,43 +296,63 @@ async function appendBotColumn(rowNumber, column, note, cap = 3000) {
 
 // Internal bot log → bot_internal (column W). Kept out of the shared
 // state_internal_notes column so the team's notes stay clean.
-async function appendInternalNote(rowNumber, note) {
+async function appendInternalNote(rowNumber: number, note: string): Promise<void> {
   return appendBotColumn(rowNumber, 'bot_internal', note);
 }
 
 // Human-readable bot note → bot_notes (column V).
-async function appendBotNote(rowNumber, note) {
+async function appendBotNote(rowNumber: number, note: string): Promise<void> {
   return appendBotColumn(rowNumber, 'bot_notes', note);
 }
 
 // Short status → bot_status (column U). Overwrites (not appended) so the
 // column always shows the latest state at a glance.
-async function setBotStatus(rowNumber, status) {
+async function setBotStatus(rowNumber: number, status: string): Promise<void> {
   const header = await readHeader();
   if (!header.includes('bot_status')) return;
   await updateRow(rowNumber, { bot_status: status });
 }
 
+type AlertField = { label: string; value: string | number };
+type Alert = {
+  emoji?: string;
+  title?: string;
+  text?: string;
+  fields?: AlertField[];
+};
+
 // Fire a Slack alert without ever letting a Slack failure break the sheet
 // write. Lazy-require keeps the sheet module decoupled from Slack. `id` and
 // store name are read from the row so the alert has context.
-async function notifyAlert(rowNumber, alert) {
+async function notifyAlert(rowNumber: number, alert: Alert): Promise<void> {
   try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
     const { sendAlert } = require('../review/slackApproval');
     const orderId = await readCell(rowNumber, 'id').catch(() => '');
     const store = await readCell(rowNumber, 'extended_provider_mealme_order_store').catch(() => '');
-    const baseFields = [
+    const baseFields: AlertField[] = [
       { label: 'Order ID', value: orderId },
       { label: 'Restaurant', value: store },
       { label: 'Sheet Row', value: rowNumber },
     ];
-    await sendAlert({ ...alert, fields: [...baseFields, ...(alert.fields || [])] });
+    await sendAlert({ ...alert, fields: [...baseFields, ...(alert.fields ?? [])] });
   } catch (err) {
-    logger.warn({ rowNumber, err: err.message }, 'notifyAlert failed (non-fatal)');
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn({ rowNumber, err: message }, 'notifyAlert failed (non-fatal)');
   }
 }
 
-async function writeSuccess(rowNumber, { grubhubOrderId, actualTotal, eta, orderUrl } = {}) {
+type WriteSuccessArgs = {
+  grubhubOrderId?: string;
+  actualTotal?: number | string | null;
+  eta?: string;
+  orderUrl?: string;
+};
+
+async function writeSuccess(
+  rowNumber: number,
+  { grubhubOrderId, actualTotal, eta, orderUrl }: WriteSuccessArgs = {},
+): Promise<void> {
   const confirmation =
     `Confirmation` +
     (orderUrl ? `\n${orderUrl}` : '') +
@@ -324,7 +375,11 @@ async function writeSuccess(rowNumber, { grubhubOrderId, actualTotal, eta, order
   logger.info({ rowNumber, grubhubOrderId }, 'row marked completed');
 }
 
-async function unlockRow(rowNumber, dryRunNote, nextState) {
+async function unlockRow(
+  rowNumber: number,
+  dryRunNote?: string,
+  nextState?: string,
+): Promise<void> {
   if (dryRunNote) {
     // Dry-run finished: leave a terminal bot_status so the row isn't re-picked.
     await setBotStatus(rowNumber, 'Dry-run OK');
@@ -340,7 +395,7 @@ async function unlockRow(rowNumber, dryRunNote, nextState) {
   logger.info({ rowNumber, nextState }, 'row unlocked');
 }
 
-async function writeFailure(rowNumber, errorMessage) {
+async function writeFailure(rowNumber: number, errorMessage: string): Promise<void> {
   // bot_status='Failed' is non-empty, so getQueuedOrders skips the row and we
   // don't re-pick it next loop. Clear column U (bot_status) to retry.
   await setBotStatus(rowNumber, 'Failed');
@@ -354,10 +409,14 @@ async function writeFailure(rowNumber, errorMessage) {
   logger.warn({ rowNumber }, 'row marked failure');
 }
 
-async function appendOrder({ id, salePrice, notes }) {
+type AppendOrderArgs = { id?: string; salePrice?: number | string; notes?: string };
+
+async function appendOrder(
+  { id, salePrice, notes }: AppendOrderArgs,
+): Promise<{ rowNumber: number | null; updatedRange: string | null | undefined }> {
   const header = await readHeader();
-  const row = new Array(header.length).fill('');
-  const set = (col, val) => {
+  const row: string[] = new Array(header.length).fill('');
+  const set = (col: string, val: unknown): void => {
     const idx = header.indexOf(col);
     if (idx !== -1) row[idx] = val == null ? '' : String(val);
   };
@@ -373,14 +432,14 @@ async function appendOrder({ id, salePrice, notes }) {
     insertDataOption: 'INSERT_ROWS',
     requestBody: { values: [row] },
   });
-  const updatedRange = res.data.updates && res.data.updates.updatedRange;
-  const m = updatedRange && updatedRange.match(/!.*?(\d+):/);
+  const updatedRange = res.data.updates?.updatedRange;
+  const m = updatedRange ? updatedRange.match(/!.*?(\d+):/) : null;
   const rowNumber = m ? parseInt(m[1], 10) : null;
   logger.info({ id, rowNumber, updatedRange }, 'test order appended');
   return { rowNumber, updatedRange };
 }
 
-async function writeReview(rowNumber, reason) {
+async function writeReview(rowNumber: number, reason: string): Promise<void> {
   await setBotStatus(rowNumber, 'Needs review');
   await appendBotNote(rowNumber, `Needs human review: ${(reason || '').slice(0, 500)}`);
   await appendInternalNote(rowNumber, `REVIEW ${String(reason || '').slice(0, 200)}`).catch(() => {});
@@ -392,7 +451,7 @@ async function writeReview(rowNumber, reason) {
   logger.warn({ rowNumber }, 'row marked review');
 }
 
-module.exports = {
+export {
   COLUMNS,
   BOT_OWNER,
   COMPLETED_STATE,

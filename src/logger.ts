@@ -1,13 +1,11 @@
-'use strict';
-
-const pino = require('pino');
+import pino from 'pino';
 
 const isDev = (process.env.NODE_ENV || 'development') !== 'production';
 
 // PII fields that may flow through logs. Keep the real Amenify sheet column
 // names AND legacy field names so logs are safe even if a code path still
 // emits old shapes.
-const PII_KEYS = new Set([
+const PII_KEYS = new Set<string>([
   'email',
   'first_name',
   'last_name',
@@ -21,7 +19,7 @@ const PII_KEYS = new Set([
   'delivery_instructions',
 ]);
 
-const REDACT_FIELDS = [
+const REDACT_FIELDS: string[] = [
   'email',
   'first_name',
   'last_name',
@@ -35,7 +33,7 @@ const REDACT_FIELDS = [
   'delivery_instructions',
 ];
 
-const baseOptions = {
+const baseOptions: pino.LoggerOptions = {
   level: process.env.LOG_LEVEL || 'info',
   redact: {
     paths: REDACT_FIELDS.flatMap((f) => [f, `*.${f}`, `order.${f}`]),
@@ -43,7 +41,7 @@ const baseOptions = {
   },
 };
 
-let transport;
+let transport: ReturnType<typeof pino.transport> | undefined;
 if (isDev) {
   transport = pino.transport({
     target: 'pino-pretty',
@@ -53,10 +51,10 @@ if (isDev) {
 
 const logger = transport ? pino(baseOptions, transport) : pino(baseOptions);
 
-function stripPii(obj) {
+function stripPii(obj: any): any {
   if (!obj || typeof obj !== 'object') return obj;
   if (Array.isArray(obj)) return obj.map(stripPii);
-  const out = {};
+  const out: Record<string, any> = {};
   for (const [k, v] of Object.entries(obj)) {
     if (PII_KEYS.has(k)) {
       out[k] = '[REDACTED]';
@@ -69,4 +67,4 @@ function stripPii(obj) {
   return out;
 }
 
-module.exports = { logger, stripPii };
+export { logger, stripPii };

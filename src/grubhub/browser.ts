@@ -1,99 +1,139 @@
+/// <reference lib="dom" />
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
-const { chromium: stealthChromium } = require('playwright-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const { chromium: vanillaChromium } = require('playwright');
-const { logger } = require('../logger');
+import fs from 'fs';
+import path from 'path';
+import { chromium } from 'playwright';
+import type { Page, Browser, BrowserContext, Locator, ElementHandle } from 'playwright';
+import { logger } from '../logger';
 
-// Stealth is only useful when we LAUNCH our own Chromium. When attaching
-// via CDP to a real Chrome the user opened, the user's browser already
-// has the right fingerprint and stealth init scripts can't apply anyway.
-stealthChromium.use(StealthPlugin());
+interface LaunchResult {
+  browser: Browser;
+  context: BrowserContext;
+  accountId: string;
+  cdpAttached: boolean;
+}
 
-const SESSIONS_DIR = path.resolve(process.cwd(), 'sessions');
+interface OrderTypeResult {
+  skipped?: boolean;
+  reason?: string;
+  ok?: boolean;
+  error?: string;
+  before?: string | null;
+  after?: string;
+}
+
+interface ClearStorageResult {
+  removed: string[];
+  kept: number;
+  localStorageKeys: number;
+  sessionStorageKeys: number;
+}
+
+// This bot ALWAYS drives the real Chrome the human launched with
+// `npm run chrome` (attached over CDP). It never launches its own browser.
+// Real Chrome carries a trusted fingerprint, so Grubhub + Google Places
+// autocomplete behave normally; a Playwright-launched Chromium trips bot
+// detection and breaks the address swap. Login lives in that Chrome's profile
+// (./chrome-profile), so there are no session/storageState files here.
+
 const SCREENSHOTS_DIR = path.resolve(process.cwd(), 'screenshots');
 
-const USER_AGENT =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
-
 const GRUBHUB_HOME = 'https://www.grubhub.com/';
-const GRUBHUB_LOGIN = 'https://www.grubhub.com/login';
 
 class BotError extends Error {
-  constructor(code, message) {
+  code: string;
+  constructor(code: string, message: string) {
     super(message);
     this.code = code;
   }
 }
 
-function ensureDirs() {
-  for (const d of [SESSIONS_DIR, SCREENSHOTS_DIR]) {
-    if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
-  }
+function ensureDirs(): void {
+  if (!fs.existsSync(SCREENSHOTS_DIR)) fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true });
 }
 
-function sessionFile(accountId) {
-  return path.join(SESSIONS_DIR, `${accountId}.json`);
-}
+// Screenshots accumulate ~8-10 per order and are never overwritten, so the
+// folder grows unbounded. Prune on demand: delete anything older than
+// SCREENSHOT_RETENTION_DAYS (default 7), then if more than
+// SCREENSHOT_MAX_FILES (default 300) remain, delete the oldest down to the cap.
+// Cheap (one readdir + stat per file) and best-effort — failures never block a run.
+let _lastPruneAt = 0;
+function pruneScreenshots(): void {
+  try {
+    // Throttle: at most once per 5 min even if called on every screenshot.
+    const now = Date.now();
+    if (now - _lastPruneAt < 5 * 60 * 1000) return;
+    _lastPruneAt = now;
 
-async function launchContext(accountId, { headless } = {}) {
-  ensureDirs();
-  const storageStatePath = sessionFile(accountId);
-  const hasSession = fs.existsSync(storageStatePath);
+    const retentionDays = parseInt(process.env.SCREENSHOT_RETENTION_DAYS || '7', 10);
+    const maxFiles = parseInt(process.env.SCREENSHOT_MAX_FILES || '300', 10);
+    if (!fs.existsSync(SCREENSHOTS_DIR)) return;
 
-  // CDP attach mode — connect to a real Chrome the user launched manually.
-  // This gets us a fully real browser fingerprint that bot-detection trusts.
-  // Use vanilla playwright here (stealth plugin can't apply to a remote browser).
-  const cdpUrl = process.env.BROWSER_CDP_URL;
-  if (cdpUrl) {
-    // Long timeout: pages on grubhub.com accumulate 100+ ad/tracking iframes
-    // and Playwright's initial Target.getTargets enumeration can be slow.
-    const browser = await vanillaChromium.connectOverCDP(cdpUrl, { timeout: 120000 });
-    const contexts = browser.contexts();
-    if (!contexts.length) {
-      throw new BotError('CDP_NO_CONTEXT', `No existing browser context at ${cdpUrl}. Open a tab and retry.`);
+    const entries = fs.readdirSync(SCREENSHOTS_DIR)
+      .filter((f) => /\.(png|html)$/i.test(f))
+      .map((f) => {
+        const full = path.join(SCREENSHOTS_DIR, f);
+        let mtime = 0;
+        try { mtime = fs.statSync(full).mtimeMs; } catch (_) { /* skip */ }
+        return { full, mtime };
+      });
+
+    const cutoff = now - retentionDays * 24 * 60 * 60 * 1000;
+    let removed = 0;
+    const survivors: { full: string; mtime: number }[] = [];
+    for (const e of entries) {
+      if (e.mtime && e.mtime < cutoff) {
+        try { fs.unlinkSync(e.full); removed += 1; } catch (_) { /* skip */ }
+      } else {
+        survivors.push(e);
+      }
     }
-    const context = contexts[0];
-    logger.info(
-      { accountId, cdpUrl, reusedContexts: contexts.length, hasSessionFile: hasSession },
-      'attached to existing Chrome via CDP',
-    );
-    return { browser, context, accountId, storageStatePath, cdpAttached: true };
+
+    // Hard cap: if still over the limit, drop the oldest survivors.
+    if (survivors.length > maxFiles) {
+      survivors.sort((a, b) => a.mtime - b.mtime); // oldest first
+      for (const e of survivors.slice(0, survivors.length - maxFiles)) {
+        try { fs.unlinkSync(e.full); removed += 1; } catch (_) { /* skip */ }
+      }
+    }
+
+    if (removed) logger.info({ removed, retentionDays, maxFiles }, 'pruned old screenshots');
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : String(err) }, 'screenshot prune failed (non-fatal)');
   }
-
-  const useHeadless = headless != null ? headless : (process.env.HEADLESS || 'true') === 'true';
-
-  const browser = await stealthChromium.launch({
-    headless: useHeadless,
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-    ],
-  });
-
-  const context = await browser.newContext({
-    storageState: hasSession ? storageStatePath : undefined,
-    userAgent: USER_AGENT,
-    viewport: { width: 1366, height: 850 },
-    locale: 'en-US',
-    timezoneId: 'America/New_York',
-  });
-
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-  });
-
-  logger.info({ accountId, hasSession, headless: useHeadless }, 'browser context launched');
-
-  return { browser, context, accountId, storageStatePath, cdpAttached: false };
 }
 
-async function detectBlockers(page) {
+// Attach to the real Chrome started with `npm run chrome` (CDP). This is the
+// ONLY browser mode. Visibility (window vs headless) is decided by that Chrome
+// launch (HEADLESS_CHROME in launchChrome.js), not here.
+async function launchContext(accountId: string): Promise<LaunchResult> {
+  ensureDirs();
+
+  const cdpUrl = process.env.BROWSER_CDP_URL;
+  if (!cdpUrl) {
+    throw new BotError(
+      'NO_CDP_URL',
+      'BROWSER_CDP_URL is not set. Start real Chrome with `npm run chrome`, then set BROWSER_CDP_URL=http://localhost:9222 in .env.',
+    );
+  }
+
+  // Long timeout: grubhub.com pages accumulate 100+ ad/tracking iframes and
+  // Playwright's initial Target.getTargets enumeration can be slow.
+  const browser = await chromium.connectOverCDP(cdpUrl, { timeout: 120000 });
+  const contexts = browser.contexts();
+  if (!contexts.length) {
+    throw new BotError('CDP_NO_CONTEXT', `No existing browser context at ${cdpUrl}. Open a tab and retry.`);
+  }
+  const context = contexts[0];
+  logger.info(
+    { accountId, cdpUrl, reusedContexts: contexts.length },
+    'attached to existing Chrome via CDP',
+  );
+  return { browser, context, accountId, cdpAttached: true };
+}
+
+async function detectBlockers(page: Page): Promise<void> {
   const content = (await page.content()).toLowerCase();
   if (
     content.includes('captcha') ||
@@ -111,21 +151,52 @@ async function detectBlockers(page) {
   }
 }
 
-async function isLoggedIn(page) {
+// STRICT login check. Requires a POSITIVE logged-in signal (the #position
+// address pill, or an account/sign-out control) — it does NOT optimistically
+// assume "logged in" when it sees nothing. The old version returned true on
+// "no sign-in link found", which false-positived on the signed-out marketing
+// homepage AND on the pre-hydration shell, letting the bot proceed against a
+// signed-out page and fail every address swap. We also poll briefly so we read
+// the hydrated nav, not the shell. Returns true only if logged-in is proven.
+async function isLoggedIn(page: Page): Promise<boolean> {
   try {
-    const accountButton = page.getByRole('button', { name: /account|sign out|hi,/i });
-    if ((await accountButton.count()) > 0) return true;
-    const signInLink = page.getByRole('link', { name: /sign in|log in/i });
-    if ((await signInLink.count()) > 0) return false;
-    const signInBtn = page.getByRole('button', { name: /sign in|log in/i });
-    if ((await signInBtn.count()) > 0) return false;
-    return true;
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      const state = await page
+        .evaluate(() => {
+          const visible = (el: Element | null): boolean => {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            const s = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+          };
+          // Positive signal #1: the logged-in address pill (#position icon).
+          for (const btn of document.querySelectorAll<HTMLElement>('div[role="button"], button[role="button"]')) {
+            if (!btn.querySelector('[data-testid="tag"]')) continue;
+            const u = btn.querySelector('use');
+            const h = u && (u.getAttribute('xlink:href') || u.getAttribute('href'));
+            if (h === '#position' && visible(btn)) return 'in';
+          }
+          const txt = document.body.innerText || '';
+          // Positive signal #2: an account / sign-out control.
+          if (/\bsign out\b|your account|account settings/i.test(txt)) return 'in';
+          // Negative signal: a sign-in / log-in prompt is showing.
+          if (/\bsign in\b|\blog in\b/i.test(txt)) return 'out';
+          return null; // not determined yet — keep polling (may be hydrating)
+        })
+        .catch(() => null);
+      if (state === 'in') return true;
+      if (state === 'out') return false;
+      await page.waitForTimeout(400);
+    }
+    // No positive logged-in signal within the window → treat as signed out.
+    return false;
   } catch {
     return false;
   }
 }
 
-async function ensureLoggedIn({ context, accountId }) {
+async function ensureLoggedIn({ context, accountId }: { context: BrowserContext; accountId: string }): Promise<Page> {
   const page = await context.newPage();
   await page.goto(GRUBHUB_HOME, { waitUntil: 'domcontentloaded', timeout: 45000 });
   await detectBlockers(page);
@@ -134,85 +205,17 @@ async function ensureLoggedIn({ context, accountId }) {
     await page.close();
     throw new BotError(
       'SESSION_EXPIRED',
-      `Session for account ${accountId} is expired or invalid. Run: npm run login -- ${accountId}`,
+      `Chrome for account ${accountId} is signed out. Open the Chrome started by \`npm run chrome\` and sign in to grubhub.com again.`,
     );
   }
   logger.info({ accountId }, 'session valid');
   return page;
 }
 
-async function loginFresh({ context, accountId, email, password }) {
-  if (!email || !password) {
-    throw new BotError('CREDENTIALS_REQUIRED', 'email and password required for fresh login');
-  }
-  const page = await context.newPage();
-  await page.goto(GRUBHUB_LOGIN, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await detectBlockers(page);
-
-  await page.getByRole('textbox', { name: /email/i }).fill(email);
-  await page.getByRole('textbox', { name: /password/i }).fill(password);
-  await page.getByRole('button', { name: /sign in|log in/i }).click();
-
-  await page.waitForLoadState('networkidle', { timeout: 45000 }).catch(() => {});
-  await detectBlockers(page);
-
-  const ok = await isLoggedIn(page);
-  if (!ok) throw new BotError('LOGIN_FAILED', 'Login submitted but session not detected');
-
-  await context.storageState({ path: sessionFile(accountId) });
-  logger.info({ accountId }, 'fresh login saved');
-  return page;
-}
-
-async function manualLoginAndSave(accountId) {
-  ensureDirs();
-  const browser = await stealthChromium.launch({
-    headless: false,
-    args: ['--disable-blink-features=AutomationControlled'],
-  });
-  const context = await browser.newContext({
-    userAgent: USER_AGENT,
-    viewport: { width: 1366, height: 850 },
-    locale: 'en-US',
-    timezoneId: 'America/New_York',
-  });
-  await context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-  });
-
-  const page = await context.newPage();
-  await page.goto(GRUBHUB_LOGIN, { waitUntil: 'domcontentloaded' });
-
-  logger.info({ accountId }, 'manual login: a browser window has opened');
-  // eslint-disable-next-line no-console
-  console.log(
-    '\n========================================================',
-  );
-  // eslint-disable-next-line no-console
-  console.log(
-    `MANUAL LOGIN for account "${accountId}"\n` +
-      `1. Complete login in the opened browser window (handle 2FA / captcha manually).\n` +
-      `2. Wait until you see the Grubhub home page logged in.\n` +
-      `3. Return here and press ENTER to save the session.\n`,
-  );
-  // eslint-disable-next-line no-console
-  console.log('========================================================\n');
-
-  await new Promise((resolve) => {
-    process.stdin.resume();
-    process.stdin.once('data', () => resolve());
-  });
-
-  const loggedIn = await isLoggedIn(page);
-  if (!loggedIn) {
-    await browser.close();
-    throw new BotError('LOGIN_NOT_DETECTED', 'Could not detect a logged-in state — try again');
-  }
-
-  await context.storageState({ path: sessionFile(accountId) });
-  logger.info({ accountId, file: sessionFile(accountId) }, 'session saved');
-  await browser.close();
-}
+// NOTE: there is no in-bot login flow anymore. Login happens once, by hand,
+// in the real Chrome you start with `npm run chrome` (sign in there; the
+// cookies persist in ./chrome-profile). The bot just attaches to that
+// already-signed-in Chrome over CDP.
 
 // Click the global-nav address pill and replace whatever's bound with the
 // resident's address from the sheet. The pill is the role="button" wrapper
@@ -229,7 +232,7 @@ async function manualLoginAndSave(accountId) {
 //      is open and nothing else is overlaying it — skip dismiss entirely.
 //   2. Selector list is intentionally tight — only EXPLICIT popup testids
 //      and known "no thanks"-style buttons. No broad `*="close"` matching.
-async function dismissPopups(page) {
+async function dismissPopups(page: Page): Promise<void> {
   const cartButtonVisible = await page.locator('#ghs-cart-checkout-button').first()
     .isVisible({ timeout: 150 }).catch(() => false);
   if (cartButtonVisible) {
@@ -280,7 +283,7 @@ async function dismissPopups(page) {
 // has non-standard suffixes like ", Unit: 4016" or trailing ", USA". Strip
 // those so we get a real suggestion list. Verification + saved-row matching
 // still use the original (street number is preserved either way).
-function placesNormalize(addr) {
+function placesNormalize(addr: string): string {
   return String(addr || '')
     .replace(/,\s*Unit\s*:?\s*[^,]+/gi, '')
     .replace(/,\s*Apt\s*\.?\s*:?\s*[^,]+/gi, '')
@@ -293,7 +296,44 @@ function placesNormalize(addr) {
     .trim();
 }
 
-async function setResidentAddressViaPill(page, address) {
+// Grubhub's homepage paints a SIGNED-OUT shell first (marketing hero, "Sign
+// in", a stale cached address in a plain search box) and only mounts the
+// logged-in global nav — including the real address PILL — a beat later once
+// JS hydrates the session. If we run the address swap during that shell window
+// we target the wrong element / stale state and the swap fails verification
+// ("pill still shows account address"). So wait for the logged-in nav to
+// hydrate (the #position address pill) before swapping. Also resolves on an
+// out-of-range modal, which is a valid logged-in state for the swap to handle.
+async function waitForLoggedInNav(page: Page, timeoutMs = 12000): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const state = await page
+      .evaluate(() => {
+        const visible = (el: Element | null): boolean => {
+          if (!el) return false;
+          const r = el.getBoundingClientRect();
+          const s = window.getComputedStyle(el);
+          return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+        };
+        const buttons = document.querySelectorAll<HTMLElement>('div[role="button"], button[role="button"]');
+        for (const btn of buttons) {
+          if (!btn.querySelector('[data-testid="tag"]')) continue;
+          const use = btn.querySelector('use');
+          const href = use && (use.getAttribute('xlink:href') || use.getAttribute('href'));
+          if (href === '#position' && visible(btn)) return 'pill';
+        }
+        const txt = document.body.innerText || '';
+        if (/outside of delivery range|update address|this store doesn'?t deliver/i.test(txt)) return 'out-of-range';
+        return null;
+      })
+      .catch(() => null);
+    if (state) return state;
+    await page.waitForTimeout(400);
+  }
+  return null;
+}
+
+async function setResidentAddressViaPill(page: Page, address: string): Promise<boolean> {
   if (!address) throw new BotError('NO_ADDRESS', 'setResidentAddressViaPill called without address');
 
   const placesAddress = placesNormalize(address);
@@ -305,6 +345,17 @@ async function setResidentAddressViaPill(page, address) {
   // pill click or subsequent autocomplete clicks.
   await dismissPopups(page);
 
+  // Wait for the logged-in nav to hydrate before touching anything. Without
+  // this the swap can run against the signed-out homepage shell (stale cached
+  // address + "Sign in"), where the real pill isn't mounted yet — which is the
+  // "address swap failed / pill still shows account address" failure.
+  const navState = await waitForLoggedInNav(page, 12000);
+  if (navState) {
+    logger.info({ navState }, 'logged-in nav hydrated — proceeding with address swap');
+  } else {
+    logger.warn('address swap: logged-in nav (address pill) did not hydrate within 12s — page may still be on the signed-out shell; proceeding with existing polls/fallbacks');
+  }
+
   // Step 0 — Fast path: peek at the pill's current text WITHOUT clicking.
   // If it already shows the resident's address, the whole type+Update
   // flow is a no-op and Grubhub will disable Update (nothing changed),
@@ -315,7 +366,7 @@ async function setResidentAddressViaPill(page, address) {
     const firstWord = streetNumMatch[2];
     const pillText = await page
       .evaluate(() => {
-        const buttons = document.querySelectorAll('div[role="button"], button[role="button"]');
+        const buttons = document.querySelectorAll<HTMLElement>('div[role="button"], button[role="button"]');
         for (const btn of buttons) {
           const tag = btn.querySelector('[data-testid="tag"]');
           if (!tag) continue;
@@ -343,7 +394,7 @@ async function setResidentAddressViaPill(page, address) {
   async function findAndClickPill() {
     return page
       .evaluate(() => {
-        const buttons = document.querySelectorAll('div[role="button"], button[role="button"]');
+        const buttons = document.querySelectorAll<HTMLElement>('div[role="button"], button[role="button"]');
         for (const btn of buttons) {
           // The pill has data-testid="tag" + class global-nav-dropdown__toggle-tag,
           // and a <use xlink:href="#position"> inside (location icon).
@@ -370,7 +421,7 @@ async function setResidentAddressViaPill(page, address) {
   // which opens the same address-input dialog the pill normally opens.
   const outOfRangeSignal = await page
     .evaluate(() => {
-      const visible = (el) => {
+      const visible = (el: Element | null): boolean => {
         if (!el) return false;
         const r = el.getBoundingClientRect();
         const s = window.getComputedStyle(el);
@@ -381,7 +432,7 @@ async function setResidentAddressViaPill(page, address) {
       const hasOutOfRange = /outside of delivery range|doesn'?t deliver to (the|your) selected address|this store doesn'?t deliver to your address/i.test(allText);
       if (!hasOutOfRange) return null;
       // Find a clickable "Change" or "Update address" / "Edit address" button.
-      const candidates = Array.from(document.querySelectorAll('button, [role="button"], a[role="button"]'));
+      const candidates = Array.from(document.querySelectorAll<HTMLElement>('button, [role="button"], a[role="button"]'));
       const targets = ['change', 'update address', 'edit address'];
       for (const t of targets) {
         for (const el of candidates) {
@@ -404,7 +455,7 @@ async function setResidentAddressViaPill(page, address) {
     logger.warn({ snippet: outOfRangeSignal.htmlSnippet }, 'out-of-range modal detected but no Change/Update button matched — will try pill anyway');
   }
 
-  let clicked = { ok: false };
+  let clicked: { ok: boolean; text?: string } = { ok: false };
   // If we already clicked Change/Update above, the input dialog should be
   // open — skip the pill search. Otherwise look for the pill.
   if (outOfRangeSignal && outOfRangeSignal.matched) {
@@ -432,14 +483,14 @@ async function setResidentAddressViaPill(page, address) {
   if (savedRowMatch) {
     const streetNum = savedRowMatch[1];
     const firstWord = savedRowMatch[2];
-    const savedRowClicked = await page
-      .evaluate(({ num, word }) => {
-        const visible = (el) => {
+    const savedRowClicked: { ok: boolean; text?: string } = await page
+      .evaluate(({ num, word }: { num: string; word: string }) => {
+        const visible = (el: Element): boolean => {
           const r = el.getBoundingClientRect();
           const s = window.getComputedStyle(el);
           return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
         };
-        const rows = document.querySelectorAll(
+        const rows = document.querySelectorAll<HTMLElement>(
           '.s-list-item-primary, [data-testid*="address-item"], [data-testid*="saved-address"], [role="option"]',
         );
         for (const row of rows) {
@@ -452,7 +503,7 @@ async function setResidentAddressViaPill(page, address) {
           const hasFirstWord = new RegExp('\\b' + word + '\\b', 'i').test(t);
           if (!startsWithNum || !hasFirstWord) continue;
           // Click the row (or its nearest clickable ancestor).
-          const clickable = row.closest('[role="option"], li, button, [role="button"]') || row;
+          const clickable = (row.closest<HTMLElement>('[role="option"], li, button, [role="button"]') || row);
           clickable.scrollIntoView({ block: 'center' });
           clickable.click();
           return { ok: true, text: t.slice(0, 80) };
@@ -503,7 +554,7 @@ async function setResidentAddressViaPill(page, address) {
     'input[type="text"][aria-label*="address" i]',
     `input[name="searchTerm"]${EXCLUDE_MENU_SEARCH}`,
   ];
-  let inputHit = null;
+  let inputHit: { loc: Locator; sel: string } | null = null;
   const deadline = Date.now() + 4000;
   while (Date.now() < deadline && !inputHit) {
     for (const sel of inputSelectors) {
@@ -630,7 +681,7 @@ async function setResidentAddressViaPill(page, address) {
     return { num, firstWord, zip, city };
   })();
 
-  function scoreOption(text) {
+  function scoreOption(text: string): number {
     const t = String(text || '');
     if (!t) return 0;
     let s = 0;
@@ -642,8 +693,8 @@ async function setResidentAddressViaPill(page, address) {
   }
 
   // Collect every visible option across all selectors, dedup by text.
-  const candidates = [];
-  const seenText = new Set();
+  const candidates: { handle: ElementHandle<Node>; text: string; sel: string; score: number }[] = [];
+  const seenText = new Set<string>();
   for (const sel of optionSelectors) {
     const handles = await page.locator(sel).elementHandles().catch(() => []);
     for (const h of handles) {
@@ -664,16 +715,16 @@ async function setResidentAddressViaPill(page, address) {
   // the input (skip distant page chrome).
   if (!candidates.length && want.num) {
     const fallback = await page
-      .evaluate((wantedNum) => {
-        const visible = (el) => {
+      .evaluate((wantedNum: string) => {
+        const visible = (el: Element): boolean => {
           const r = el.getBoundingClientRect();
           const s = window.getComputedStyle(el);
           return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
         };
-        const startsWithNum = (t) =>
+        const startsWithNum = (t: string): boolean =>
           t.startsWith(wantedNum + ' ') || t.startsWith(wantedNum + ',');
-        const out = [];
-        for (const el of document.querySelectorAll('li, button, [role="button"], div, a')) {
+        const out: { idx: number; text: string }[] = [];
+        for (const el of document.querySelectorAll<HTMLElement>('li, button, [role="button"], div, a')) {
           if (!visible(el)) continue;
           const t = (el.innerText || '').trim();
           if (!t || t.length > 200) continue;
@@ -748,7 +799,7 @@ async function setResidentAddressViaPill(page, address) {
   // real keystroke. Wait for the Update button to be both visible AND
   // enabled; if it stays disabled, type one trailing space + backspace to
   // force the listener, then try again.
-  let updateHit = null;
+  let updateHit: { btn: Locator; sel: string } | null = null;
   const updateDeadline = Date.now() + 3000;
   while (Date.now() < updateDeadline) {
     updateHit = await findUpdateBtn();
@@ -784,13 +835,13 @@ async function setResidentAddressViaPill(page, address) {
     } catch (_) { /* non-fatal */ }
     const diag = await page
       .evaluate(() => {
-        const visible = (el) => {
+        const visible = (el: Element): boolean => {
           const r = el.getBoundingClientRect();
           const s = window.getComputedStyle(el);
           return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
         };
-        const out = [];
-        for (const el of document.querySelectorAll('button, [role="button"]')) {
+        const out: { tag: string; text: string; testid: string | null; disabled: boolean; cls: string }[] = [];
+        for (const el of document.querySelectorAll<HTMLElement>('button, [role="button"]')) {
           if (!visible(el)) continue;
           const t = (el.innerText || '').trim();
           if (!/update|save|done|confirm|apply|submit/i.test(t)) continue;
@@ -865,7 +916,7 @@ async function setResidentAddressViaPill(page, address) {
   // again and check it now starts with the resident's street number.
   const afterPillText = await page
     .evaluate(() => {
-      const btns = document.querySelectorAll('div[role="button"], button[role="button"]');
+      const btns = document.querySelectorAll<HTMLElement>('div[role="button"], button[role="button"]');
       for (const b of btns) {
         const useEl = b.querySelector('use');
         const href = useEl && (useEl.getAttribute('xlink:href') || useEl.getAttribute('href'));
@@ -902,14 +953,14 @@ async function setResidentAddressViaPill(page, address) {
 // the rest of the codebase uses), this function maps to Grubhub's wire
 // format. A no-op if orderType is null/empty (don't disturb the user's
 // existing setting).
-async function setGrubhubOrderType(page, orderType) {
+async function setGrubhubOrderType(page: Page, orderType: string | null | undefined): Promise<OrderTypeResult> {
   if (!orderType) return { skipped: true, reason: 'no orderType' };
   const wire = orderType === 'pickup' ? 'pickup' : 'standard';
   await page.goto(GRUBHUB_HOME, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-  const res = await page
-    .evaluate((wireMode) => {
+  const res: OrderTypeResult = await page
+    .evaluate((wireMode: string) => {
       const KEY = 'ngStorage-cartState';
-      let parsed;
+      let parsed: Record<string, any>;
       try {
         const raw = window.localStorage.getItem(KEY);
         parsed = raw ? JSON.parse(raw) : {};
@@ -919,11 +970,11 @@ async function setGrubhubOrderType(page, orderType) {
       try {
         window.localStorage.setItem(KEY, JSON.stringify(parsed));
       } catch (e) {
-        return { ok: false, error: e.message, before };
+        return { ok: false, error: e instanceof Error ? e.message : String(e), before };
       }
       return { ok: true, before, after: wireMode };
     }, wire)
-    .catch((e) => ({ ok: false, error: e.message }));
+    .catch((e) => ({ ok: false, error: e instanceof Error ? e.message : String(e) }));
   logger.info({ orderType, wire, ...res }, 'set Grubhub orderType in localStorage');
   return res;
 }
@@ -939,15 +990,15 @@ async function setGrubhubOrderType(page, orderType) {
 // throws SESSION_EXPIRED even though the auth cookie is still valid. So we
 // remove a denylist of cart/address keys and explicitly preserve anything that
 // looks like auth/token/user/session/login.
-async function clearGrubhubStorage(page) {
+async function clearGrubhubStorage(page: Page): Promise<ClearStorageResult> {
   await page.goto(GRUBHUB_HOME, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-  const res = await page
+  const res: ClearStorageResult = await page
     .evaluate(() => {
       // Keys that carry the stale per-order state we want gone.
       const STALE_RE = /cart|address|location|delivery|recent|restaurant|logistics|ngStorage-cartState/i;
       // Keys we must never touch — they carry the login/session.
       const KEEP_RE = /auth|token|session|login|user|account|credential|jwt|oauth|perimeterx|_px/i;
-      const out = { removed: [], kept: 0, localStorageKeys: 0, sessionStorageKeys: 0 };
+      const out: ClearStorageResult = { removed: [] as string[], kept: 0, localStorageKeys: 0, sessionStorageKeys: 0 };
       try {
         const keys = Object.keys(window.localStorage);
         out.localStorageKeys = keys.length;
@@ -978,29 +1029,35 @@ async function clearGrubhubStorage(page) {
   return res;
 }
 
-async function saveScreenshot(page, label) {
+async function saveScreenshot(page: Page, label: string, opts: { fullPage?: boolean } = {}): Promise<string | null> {
+  const { fullPage = false } = opts;
   ensureDirs();
+  pruneScreenshots(); // best-effort, throttled to once/5min
   const safe = String(label || 'screenshot').replace(/[^a-z0-9_-]/gi, '_');
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
   const file = path.join(SCREENSHOTS_DIR, `${ts}_${safe}.png`);
-  // fullPage on Grubhub menus can stall past 30s waiting for lazy images.
-  // Viewport-only with a short timeout is enough for debugging and never blocks the run.
+  // fullPage on Grubhub menus can stall past 30s waiting for lazy images, so it
+  // is opt-in (opts.fullPage) — used for the pre-payment approval snapshot where
+  // the human approver needs to see the entire order. Default stays viewport-only.
   try {
-    await page.screenshot({ path: file, fullPage: false, timeout: 10000, animations: 'disabled' });
+    // Let the SPA finish painting before we capture, so screenshots aren't blank
+    // white shells taken right after domcontentloaded. Bounded + non-fatal: a
+    // never-idle page (Grubhub long-polling) can't block the run.
+    await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => {});
+    // Full-page captures need a longer ceiling since lazy images load on scroll.
+    await page.screenshot({ path: file, fullPage, timeout: fullPage ? 25000 : 10000, animations: 'disabled' });
     logger.info({ file, label }, 'screenshot saved');
     return file;
   } catch (err) {
-    logger.warn({ label, err: err && err.message }, 'screenshot failed — continuing');
+    logger.warn({ label, err: err instanceof Error ? err.message : String(err) }, 'screenshot failed — continuing');
     return null;
   }
 }
 
-module.exports = {
+export {
   BotError,
   launchContext,
   ensureLoggedIn,
-  loginFresh,
-  manualLoginAndSave,
   saveScreenshot,
   detectBlockers,
   isLoggedIn,

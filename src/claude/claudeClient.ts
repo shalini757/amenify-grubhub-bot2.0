@@ -1,21 +1,79 @@
-'use strict';
-
-const Anthropic = require('@anthropic-ai/sdk');
-const { logger } = require('../logger');
+import Anthropic from '@anthropic-ai/sdk';
+import fs from 'fs';
+import { logger } from '../logger';
 
 const MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
 const HEALTH_MODEL = process.env.CLAUDE_HEALTH_MODEL || 'claude-haiku-4-5-20251001';
 
-class ClaudeInvalidJsonError extends Error {
-  constructor(message, raw) {
+// ---- Shared shapes ---------------------------------------------------------
+
+export type CandidateKind = 'exact' | 'fuzzy';
+
+export interface Candidate {
+  matched_name: string;
+  matched_price: number | null;
+  confidence: number;
+  kind: CandidateKind;
+  notes: string;
+}
+
+export interface RankedEntry {
+  requested: string;
+  candidates: Candidate[];
+}
+
+export interface RankedResult {
+  ranked: RankedEntry[];
+}
+
+export interface BudgetPick {
+  requested: string;
+  qty: number;
+  matched_name: string;
+  matched_price: number | null;
+  confidence: number;
+  kind: CandidateKind;
+  notes: string;
+}
+
+export interface BudgetAttempt {
+  label: string;
+  total: number;
+  picks: string[];
+}
+
+export interface BudgetMatchResult {
+  withinBudget: boolean;
+  picks: BudgetPick[];
+  totalUsed: number;
+  reason: string | null;
+  attempts: BudgetAttempt[];
+  exactCount?: number;
+  rankedRaw?: RankedEntry[];
+}
+
+export interface RequestedItem {
+  name?: string;
+  qty?: number;
+  [key: string]: unknown;
+}
+
+// ---- Errors ----------------------------------------------------------------
+
+export class ClaudeInvalidJsonError extends Error {
+  code: string;
+  raw: unknown;
+  constructor(message: string, raw: unknown) {
     super(message);
     this.code = 'CLAUDE_INVALID_JSON';
     this.raw = raw;
   }
 }
 
-let _client;
-function client() {
+// ---- Client ----------------------------------------------------------------
+
+let _client: Anthropic | undefined;
+function client(): Anthropic {
   if (!_client) {
     const key = process.env.ANTHROPIC_API_KEY;
     if (!key) {
@@ -26,8 +84,8 @@ function client() {
   return _client;
 }
 
-function logUsage(label, response) {
-  const usage = response && response.usage ? response.usage : {};
+function logUsage(label: string, response: Anthropic.Message): void {
+  const usage = response && response.usage ? response.usage : ({} as Anthropic.Usage);
   logger.info(
     {
       label,
@@ -41,16 +99,16 @@ function logUsage(label, response) {
   );
 }
 
-function extractText(response) {
+function extractText(response: Anthropic.Message): string {
   if (!response || !Array.isArray(response.content)) return '';
   return response.content
-    .filter((b) => b.type === 'text')
+    .filter((b): b is Anthropic.TextBlock => b.type === 'text')
     .map((b) => b.text)
     .join('\n')
     .trim();
 }
 
-function parseJsonStrict(text, label) {
+function parseJsonStrict(text: string, label: string): any {
   if (!text) throw new ClaudeInvalidJsonError(`${label}: empty response`, text);
   let candidate = text.trim();
   if (candidate.startsWith('```')) {
@@ -67,11 +125,12 @@ function parseJsonStrict(text, label) {
     return JSON.parse(candidate);
   } catch (err) {
     console.log('[claude] bad JSON:', text);
-    throw new ClaudeInvalidJsonError(`${label}: invalid JSON — ${err.message}`, text);
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new ClaudeInvalidJsonError(`${label}: invalid JSON — ${msg}`, text);
   }
 }
 
-function stripHtml(html) {
+function stripHtml(html: string | null | undefined): string {
   if (!html) return '';
   return String(html)
     .replace(/<script[\s\S]*?<\/script>/gi, '')
@@ -82,7 +141,15 @@ function stripHtml(html) {
     .trim();
 }
 
-async function helloWorld() {
+// ---- High-level calls ------------------------------------------------------
+
+export interface HelloWorldResult {
+  ok: boolean;
+  text: string;
+  model: string;
+}
+
+async function helloWorld(): Promise<HelloWorldResult> {
   console.log('[claude] helloWorld');
   const res = await client().messages.create({
     model: HEALTH_MODEL,
@@ -94,7 +161,23 @@ async function helloWorld() {
   return { ok: /OK/i.test(text), text, model: res.model };
 }
 
-async function matchItems({ requestedItems, menu }) {
+export interface MatchItemsResult {
+  matches: Array<{
+    requested: string;
+    matched_id: string | null;
+    matched_name: string | null;
+    confidence: number;
+    notes: string;
+  }>;
+}
+
+async function matchItems({
+  requestedItems,
+  menu,
+}: {
+  requestedItems: RequestedItem[];
+  menu: unknown;
+}): Promise<MatchItemsResult> {
   console.log('[claude] matchItems', requestedItems);
   if (!Array.isArray(requestedItems) || !requestedItems.length) {
     throw new Error('matchItems: requestedItems must be a non-empty array');
@@ -147,7 +230,15 @@ async function matchItems({ requestedItems, menu }) {
 //   ]}
 // Each candidates list is ordered best→worst: highest-confidence exact first,
 // then fuzzy. Up to MAX_CANDIDATES per requested item (default 4).
-async function rankCandidates({ requestedItems, menu, maxCandidatesPerItem = 4 }) {
+async function rankCandidates({
+  requestedItems,
+  menu,
+  maxCandidatesPerItem = 4,
+}: {
+  requestedItems: RequestedItem[];
+  menu: unknown;
+  maxCandidatesPerItem?: number;
+}): Promise<RankedResult> {
   console.log('[claude] rankCandidates', requestedItems.length, 'items');
   if (!Array.isArray(requestedItems) || !requestedItems.length) {
     throw new Error('rankCandidates: requestedItems must be a non-empty array');
@@ -187,7 +278,7 @@ async function rankCandidates({ requestedItems, menu, maxCandidatesPerItem = 4 }
   if (!parsed || !Array.isArray(parsed.ranked)) {
     throw new ClaudeInvalidJsonError('rankCandidates: missing ranked[]', text);
   }
-  console.log('[claude] rankCandidates → candidates per item:', parsed.ranked.map((r) => `${r.requested}=${r.candidates?.length || 0}`).join(', '));
+  console.log('[claude] rankCandidates → candidates per item:', parsed.ranked.map((r: RankedEntry) => `${r.requested}=${r.candidates?.length || 0}`).join(', '));
   return parsed;
 }
 
@@ -210,7 +301,30 @@ async function rankCandidates({ requestedItems, menu, maxCandidatesPerItem = 4 }
 //   quantities: array of qty for each requested item (same order as ranked)
 //   maxTotal:  budget cap
 //   confidenceThreshold: minimum confidence to consider a candidate
-function solveBudget({ ranked, quantities, maxTotal, confidenceThreshold = 0.85 }) {
+interface FilteredItem {
+  requested: string;
+  qty: number;
+  candidates: Candidate[];
+}
+
+interface ComboScore {
+  score: number;
+  exactCount: number;
+  confSum: number;
+  costSum: number;
+}
+
+function solveBudget({
+  ranked,
+  quantities,
+  maxTotal,
+  confidenceThreshold = 0.85,
+}: {
+  ranked: RankedEntry[];
+  quantities: number[];
+  maxTotal: number;
+  confidenceThreshold?: number;
+}): BudgetMatchResult {
   if (!Array.isArray(ranked) || !ranked.length) {
     return { withinBudget: false, picks: [], totalUsed: 0, reason: 'No items to match', attempts: [] };
   }
@@ -220,8 +334,9 @@ function solveBudget({ ranked, quantities, maxTotal, confidenceThreshold = 0.85 
 
   // Filter each item's candidates by confidence threshold. If an item has no
   // candidates above threshold, we already know we can't ship it — fail fast.
-  const filtered = ranked.map((r, idx) => {
-    const qty = Number.isFinite(quantities[idx]) && quantities[idx] > 0 ? quantities[idx] : 1;
+  const filtered: FilteredItem[] = ranked.map((r, idx) => {
+    const qtyRaw = quantities[idx];
+    const qty = Number.isFinite(qtyRaw) && qtyRaw > 0 ? qtyRaw : 1;
     const valid = (r.candidates || [])
       .filter((c) => typeof c.matched_price === 'number' && c.matched_price >= 0)
       .filter((c) => (c.confidence || 0) >= confidenceThreshold);
@@ -246,7 +361,7 @@ function solveBudget({ ranked, quantities, maxTotal, confidenceThreshold = 0.85 
   // The exact-count term dominates (prefer all-exacts over all-fuzzy), then
   // confidence (prefer 0.95 fuzzy over 0.85 fuzzy), then budget-utilization
   // (prefer $24 of $25 over $10 of $25, but only as a tiebreaker).
-  function scoreCombo(picks) {
+  function scoreCombo(picks: Candidate[]): ComboScore {
     let exactCount = 0;
     let confSum = 0;
     let costSum = 0;
@@ -271,8 +386,8 @@ function solveBudget({ ranked, quantities, maxTotal, confidenceThreshold = 0.85 
     combinationCount = filtered.reduce((acc, f) => acc * f.candidates.length, 1);
   }
 
-  let best = null;
-  let closestOver = null; // closest over-budget combo, for diagnostics
+  let best: ({ picks: Candidate[] } & ComboScore) | null = null;
+  let closestOver: ({ picks: Candidate[] } & ComboScore) | null = null; // closest over-budget combo, for diagnostics
 
   // Iterative N-dimensional enumeration (no recursion → no stack risk).
   const idx = new Array(filtered.length).fill(0);
@@ -318,7 +433,7 @@ function solveBudget({ ranked, quantities, maxTotal, confidenceThreshold = 0.85 
   // reviewer can see what we tried.
   const cheapestAttempt = filtered.map((f) => f.candidates[f.candidates.length - 1]);
   const cheapestCost = cheapestAttempt.reduce((acc, p, i) => acc + (p.matched_price || 0) * filtered[i].qty, 0);
-  const attempts = [
+  const attempts: BudgetAttempt[] = ([
     closestOver && {
       label: 'closest-over-budget',
       total: +closestOver.costSum.toFixed(2),
@@ -329,7 +444,7 @@ function solveBudget({ ranked, quantities, maxTotal, confidenceThreshold = 0.85 
       total: +cheapestCost.toFixed(2),
       picks: cheapestAttempt.map((p, i) => `"${filtered[i].requested}" -> ${p.matched_name} @ $${p.matched_price} (${p.kind})`),
     },
-  ].filter(Boolean);
+  ].filter(Boolean) as BudgetAttempt[]);
 
   return {
     withinBudget: false,
@@ -341,9 +456,19 @@ function solveBudget({ ranked, quantities, maxTotal, confidenceThreshold = 0.85 
 }
 
 // Convenience: end-to-end (Claude rank → solve). Most callers want this.
-async function matchItemsBudgetAware({ requestedItems, menu, maxTotal, confidenceThreshold = 0.85 }) {
+async function matchItemsBudgetAware({
+  requestedItems,
+  menu,
+  maxTotal,
+  confidenceThreshold = 0.85,
+}: {
+  requestedItems: RequestedItem[];
+  menu: unknown;
+  maxTotal: number;
+  confidenceThreshold?: number;
+}): Promise<BudgetMatchResult> {
   const ranked = await rankCandidates({ requestedItems, menu });
-  const quantities = requestedItems.map((it) => it.qty);
+  const quantities = requestedItems.map((it) => it.qty as number);
   const solved = solveBudget({
     ranked: ranked.ranked,
     quantities,
@@ -359,7 +484,23 @@ async function matchItemsBudgetAware({ requestedItems, menu, maxTotal, confidenc
 // each pick back to a DOM option by text match (with cheapest as fallback
 // when the named option can't be located, so a hallucinated label can't
 // block the cart).
-async function pickModifiers({ itemName, sections }) {
+export interface ModifierPick {
+  sectionKey: string;
+  optionText: string;
+  reason: string;
+}
+
+export interface PickModifiersResult {
+  picks: ModifierPick[];
+}
+
+async function pickModifiers({
+  itemName,
+  sections,
+}: {
+  itemName: string;
+  sections: unknown[];
+}): Promise<PickModifiersResult> {
   console.log('[claude] pickModifiers', itemName, sections.length, 'sections');
   if (!Array.isArray(sections) || !sections.length) {
     return { picks: [] };
@@ -393,7 +534,15 @@ async function pickModifiers({ itemName, sections }) {
   return parsed;
 }
 
-async function parseConfirmation({ html }) {
+export interface ParseConfirmationResult {
+  success: boolean;
+  order_id: string | null;
+  total: number | null;
+  eta: string | null;
+  notes: string;
+}
+
+async function parseConfirmation({ html }: { html: string | null | undefined }): Promise<ParseConfirmationResult> {
   console.log('[claude] parseConfirmation');
   const cleaned = stripHtml(html);
   const system =
@@ -418,17 +567,31 @@ async function parseConfirmation({ html }) {
   return parsed;
 }
 
-async function reasonAboutError({ screenshotPath, screenshotBase64, dom }) {
+export interface ReasonAboutErrorResult {
+  what_happened: string;
+  recommended_action: string;
+  blocker_type: string;
+  retryable: boolean;
+}
+
+async function reasonAboutError({
+  screenshotPath,
+  screenshotBase64,
+  dom,
+}: {
+  screenshotPath?: string;
+  screenshotBase64?: string;
+  dom: string | null | undefined;
+}): Promise<ReasonAboutErrorResult> {
   console.log('[claude] reasonAboutError');
   const cleaned = stripHtml(dom);
-  const userBlocks = [];
+  const userBlocks: Anthropic.ContentBlockParam[] = [];
   if (screenshotBase64) {
     userBlocks.push({
       type: 'image',
       source: { type: 'base64', media_type: 'image/png', data: screenshotBase64 },
     });
   } else if (screenshotPath) {
-    const fs = require('fs');
     if (fs.existsSync(screenshotPath)) {
       const b64 = fs.readFileSync(screenshotPath).toString('base64');
       userBlocks.push({
@@ -464,8 +627,7 @@ async function reasonAboutError({ screenshotPath, screenshotBase64, dom }) {
   return parsed;
 }
 
-module.exports = {
-  ClaudeInvalidJsonError,
+export {
   helloWorld,
   matchItems,
   rankCandidates,

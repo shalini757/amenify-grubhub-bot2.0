@@ -1,15 +1,14 @@
 'use strict';
 
-require('dotenv').config();
+import 'dotenv/config';
 
-const http = require('http');
-const { logger } = require('./logger');
-const sheetClient = require('./sheet/sheetClient');
-const claudeClient = require('./claude/claudeClient');
-const { listAccounts, pickAccount } = require('./accounts/accountPicker');
-const { sendReviewAlert } = require('./review/reviewQueue');
-const {
-  manualLoginAndSave,
+import http from 'http';
+import { logger } from './logger';
+import * as sheetClient from './sheet/sheetClient';
+import * as claudeClient from './claude/claudeClient';
+import { listAccounts, pickAccount } from './accounts/accountPicker';
+import { sendReviewAlert } from './review/reviewQueue';
+import {
   launchContext,
   ensureLoggedIn,
   detectBlockers,
@@ -17,21 +16,39 @@ const {
   setGrubhubOrderType,
   setResidentAddressViaPill,
   clearGrubhubStorage,
-} = require('./grubhub/browser');
-const { parseNotes } = require('./parse/notesParser');
-const { parseItems } = require('./parse/itemsParser');
-const { scrapeMenu, tryPreorder, switchToPickup } = require('./grubhub/menuScraper');
-const cart = require('./grubhub/cart');
+} from './grubhub/browser';
+import { parseNotes, ParsedNotes } from './parse/notesParser';
+import { parseItems } from './parse/itemsParser';
+import { scrapeMenu, searchMenuItems, tryPreorder, switchToPickup } from './grubhub/menuScraper';
+import * as cart from './grubhub/cart';
 
-async function cmdCheck() {
+// The notes parser exposes resident* fields; some legacy call sites also read
+// customer* aliases that the parser does not (and never did) populate — at
+// runtime these were simply `undefined`. Model that exactly so the strict
+// compiler accepts the access without changing behavior.
+type ParsedNotesWithAliases = ParsedNotes & {
+  customerFirstName?: string;
+  customerLastName?: string;
+  customerPhone?: string;
+};
+
+type CheckResult = { ok?: boolean; [key: string]: unknown };
+type VerifyResults = {
+  sheet: CheckResult | null;
+  claude: CheckResult | null;
+  accounts: CheckResult | null;
+  slack: CheckResult | null;
+};
+
+async function cmdCheck(): Promise<void> {
   logger.info('--- Day 1 verification ---');
-  const results = { sheet: null, claude: null, accounts: null, slack: null };
+  const results: VerifyResults = { sheet: null, claude: null, accounts: null, slack: null };
 
   try {
     const meta = await sheetClient.verifyConnection();
     results.sheet = { ok: true, title: meta.title, tab: meta.tab };
     logger.info({ title: meta.title, tab: meta.tab }, '[OK] Google Sheets reachable');
-  } catch (err) {
+  } catch (err: any) {
     results.sheet = { ok: false, error: err.message };
     logger.error({ err: err.message }, '[FAIL] Google Sheets');
   }
@@ -41,7 +58,7 @@ async function cmdCheck() {
     results.claude = { ok: r.ok, model: r.model };
     if (r.ok) logger.info({ model: r.model }, '[OK] Claude API reachable');
     else logger.warn({ text: r.text }, '[WARN] Claude responded but content unexpected');
-  } catch (err) {
+  } catch (err: any) {
     results.claude = { ok: false, error: err.message };
     logger.error({ err: err.message }, '[FAIL] Claude API');
   }
@@ -50,7 +67,7 @@ async function cmdCheck() {
     const accts = listAccounts();
     results.accounts = { ok: true, count: accts.length, ids: accts.map((a) => a.id) };
     logger.info({ count: accts.length, ids: accts.map((a) => a.id) }, '[OK] Grubhub accounts loaded');
-  } catch (err) {
+  } catch (err: any) {
     results.accounts = { ok: false, error: err.message };
     logger.error({ err: err.message }, '[FAIL] Account config');
   }
@@ -62,10 +79,10 @@ async function cmdCheck() {
       reason: 'Day 1 connectivity test — no real order data.',
       order: { order_id: 'health-check', account: 'n/a', restaurant_name: 'n/a' },
     });
-    results.slack = slack;
+    results.slack = slack as unknown as CheckResult;
     if (slack.sent) logger.info('[OK] Slack webhook reachable');
     else logger.warn({ slack }, '[WARN] Slack webhook not configured or not reachable');
-  } catch (err) {
+  } catch (err: any) {
     results.slack = { ok: false, error: err.message };
     logger.error({ err: err.message }, '[FAIL] Slack');
   }
@@ -79,18 +96,21 @@ async function cmdCheck() {
   process.exit(allOk ? 0 : 1);
 }
 
-async function cmdLogin(accountId) {
-  if (!accountId) {
-    // eslint-disable-next-line no-console
-    console.error('Usage: npm run login -- <accountId>');
-    process.exit(2);
-  }
-  await manualLoginAndSave(accountId);
-  logger.info({ accountId }, 'login flow completed');
+function cmdLogin(): void {
+  // Login is no longer handled by the bot. The bot drives the real Chrome you
+  // start with `npm run chrome`; sign in there once and the cookies persist in
+  // ./chrome-profile.
+  // eslint-disable-next-line no-console
+  console.log(
+    '\nLogin is now manual, inside the real Chrome:\n' +
+      '  1. npm run chrome   (a Chrome window opens using ./chrome-profile)\n' +
+      '  2. Go to grubhub.com and sign in (handle any 2FA/captcha yourself)\n' +
+      '  3. Leave it signed in — the bot attaches to it over CDP.\n',
+  );
   process.exit(0);
 }
 
-async function cmdOrder() {
+async function cmdOrder(): Promise<void> {
   const code = await processOneOrder();
   process.exit(code);
 }
@@ -109,7 +129,7 @@ async function cmdOrder() {
 // This does a cheap (3s) HTTP probe of Chrome's DevTools endpoint BEFORE any
 // row is locked. Chrome always serves GET /json/version on the debug port.
 // Returns { ok, reason } — ok:false means "pause the queue, touch no rows".
-function preflightChromeReachable() {
+function preflightChromeReachable(): Promise<{ ok: boolean; reason?: string }> {
   const cdpUrl = process.env.BROWSER_CDP_URL;
   if (!cdpUrl) return Promise.resolve({ ok: true }); // launch-own-Chrome mode — nothing to probe
   const probeUrl = cdpUrl.replace(/\/+$/, '') + '/json/version';
@@ -127,13 +147,13 @@ function preflightChromeReachable() {
       req.destroy();
       resolve({ ok: false, reason: `no response from ${probeUrl} within 3s` });
     });
-    req.on('error', (err) => {
+    req.on('error', (err: any) => {
       resolve({ ok: false, reason: `${err.code || err.message} connecting to ${probeUrl}` });
     });
   });
 }
 
-async function processOneOrder() {
+async function processOneOrder(): Promise<number> {
   const DRY_RUN = (process.env.DRY_RUN || 'true').toLowerCase() === 'true';
   const CONFIDENCE_THRESHOLD = parseFloat(process.env.CONFIDENCE_THRESHOLD || '0.85');
   const MIN_AVG_CONFIDENCE = parseFloat(process.env.MIN_AVG_CONFIDENCE || '0.92');
@@ -142,9 +162,10 @@ async function processOneOrder() {
   const MAX_TOTAL_BASIS = (process.env.MAX_TOTAL_BASIS || 'all_in').toLowerCase();
 
   let exitCode = 0;
-  let browser;
-  let ctx;
-  let lockedRow = null;
+  let browser: Awaited<ReturnType<typeof launchContext>>['browser'] | undefined;
+  let ctx: Awaited<ReturnType<typeof launchContext>> | undefined;
+  let page: Awaited<ReturnType<typeof ensureLoggedIn>> | undefined; // the per-order tab; closed in finally so tabs don't pile up in CDP Chrome
+  let lockedRow: number | null = null;
 
   try {
     // Pre-flight 1: don't lock a row if the debug Chrome isn't even up. Returns
@@ -167,26 +188,79 @@ async function processOneOrder() {
       return 2;
     }
 
-    const order = orders[0];
-    logger.info({ row: order._rowNumber, id: order.id }, 'processing order');
+    // Process the NEWEST ready row (highest row number), not the oldest.
+    // getQueuedOrders returns rows top→bottom, so orders[0] was the oldest
+    // ready row — which, with the sheet's leftover duplicate rows, meant a
+    // brand-new row you just added would lose to an old still-"ready" duplicate
+    // (you'd get a Slack card for the PREVIOUS order). Picking the highest row
+    // makes "add a row → that row runs" hold.
+    const order = orders.slice().sort((a, b) => b._rowNumber - a._rowNumber)[0];
+    logger.info(
+      { row: order._rowNumber, id: order.id, readyCount: orders.length },
+      'processing order (newest ready row)',
+    );
 
-    const parsed = parseNotes(order.notes);
+    const parsed = parseNotes(order.notes) as ParsedNotesWithAliases;
     if (!parsed.isGrubhub || !parsed.orderUrl) {
       await sheetClient.writeReview(order._rowNumber, 'Notes do not contain a Grubhub order URL');
       exitCode = 1;
-      return;
+      return exitCode;
     }
 
-    const items = parseItems(parsed.items);
+    // ITEMS — source of truth is the structured product-list column (L,
+    // extended_provider_mealme_order_product_list), NOT the free-text notes
+    // "Items:" line. The notes blob is hand-written and goes stale: editing
+    // the real column would otherwise be ignored and the bot would re-order
+    // whatever the notes happened to say. Fall back to notes only if the
+    // column is blank (legacy rows), logging which source was used.
+    const productListCol = (order['extended_provider_mealme_order_product_list'] || '').toString().trim();
+    const itemsSource = productListCol ? 'column_L_product_list' : 'notes_items_line';
+    const itemsRaw = productListCol || parsed.items;
+    const items = parseItems(itemsRaw);
     if (!items.length) {
-      await sheetClient.writeReview(order._rowNumber, `Could not parse items from notes. Raw: ${(parsed.items || '').slice(0, 200)}`);
+      await sheetClient.writeReview(
+        order._rowNumber,
+        `Could not parse items from ${itemsSource}. Raw: ${(itemsRaw || '').slice(0, 200)}`,
+      );
       exitCode = 1;
-      return;
+      return exitCode;
     }
     logger.info(
-      { items, store: parsed.store, orderType: parsed.orderType, targetTime: parsed.targetTime, maxTotal: parsed.maxTotal },
+      { items, itemsSource, store: parsed.store, orderType: parsed.orderType, targetTime: parsed.targetTime, maxTotal: parsed.maxTotal },
       'parsed request',
     );
+
+    // ADDRESS — source of truth is the structured address column (S, `address`)
+    // plus unit column (T, `unit`), NOT the free-text notes "Resident address:"
+    // line. The column holds the clean, fully-spelled street ("3860 Tallgrass
+    // Prairie Lane") that Google Places autocompletes reliably; the notes line
+    // is hand-abbreviated ("3860 Tallgrass Pr Ln") and frequently fails to
+    // match a Places suggestion → the "address swap failed" review. Fall back
+    // to the notes value only if the column is blank (legacy rows).
+    const addressCol = (order['address'] || '').toString().trim();
+    const unitCol = (order['unit'] || '').toString().trim();
+    let deliveryAddress: string;
+    let addressSource: string;
+    if (addressCol) {
+      // Append the unit only if the column value doesn't already carry one.
+      deliveryAddress = unitCol && !/\bunit\b|#/i.test(addressCol)
+        ? `${addressCol}, Unit: ${unitCol}`
+        : addressCol;
+      addressSource = 'column_S_address';
+    } else {
+      deliveryAddress = parsed.deliveryAddress;
+      addressSource = 'notes_resident_address';
+    }
+    // Resident unit/apt for the checkout "Apt., suite, floor" field (#address2).
+    // Source order: the unit column, then the address column string, then the
+    // NOTES "Resident address:" line — the unit is often ONLY in the notes
+    // (e.g. "...USA, Unit: 1B") while the address column has no unit, so we must
+    // check the notes too or we silently drop it.
+    const UNIT_RE = /\b(?:unit|apt|apartment|suite|ste|#)\s*:?\s*([\w-]+)/i;
+    const unitFromAddrCol = ((deliveryAddress || '').match(UNIT_RE) || [])[1] || '';
+    const unitFromNotes = ((parsed.deliveryAddress || '').match(UNIT_RE) || [])[1] || '';
+    const residentUnit = unitCol || unitFromAddrCol || unitFromNotes || '';
+    logger.info({ deliveryAddress, addressSource, residentUnit }, 'resolved delivery address');
 
     // Delivery orders need a resident address to fill on the checkout page.
     // Pickup orders skip it. If the order type wasn't parseable, default to
@@ -197,10 +271,10 @@ async function processOneOrder() {
     // order #2+ starts with the account's stale address). Pickup orders have no
     // address to set, so they're cleared to navigate immediately.
     let addressReady = isPickup;
-    if (!isPickup && !parsed.deliveryAddress) {
-      await sheetClient.writeReview(order._rowNumber, 'Delivery order is missing "Resident address:" line — cannot fill checkout');
+    if (!isPickup && !deliveryAddress) {
+      await sheetClient.writeReview(order._rowNumber, 'Delivery order is missing an address (column S `address` and notes "Resident address:" both empty) — cannot fill checkout');
       exitCode = 1;
-      return;
+      return exitCode;
     }
 
     // Pre-flight 2: attach to Chrome and HARD-assert signed-in BEFORE locking
@@ -219,7 +293,7 @@ async function processOneOrder() {
       );
     }
 
-    const page = await ensureLoggedIn(ctx);
+    page = await ensureLoggedIn(ctx);
 
     // ensureLoggedIn uses a loose regex that false-positives on "Create an
     // account" links. Run the strong probe before doing anything else — if
@@ -243,7 +317,7 @@ async function processOneOrder() {
     // as a fresh Grubhub before we change the address. Reloads grubhub.com.
     try {
       await clearGrubhubStorage(page);
-    } catch (e) {
+    } catch (e: any) {
       logger.warn({ err: e.message }, 'clearGrubhubStorage failed (continuing)');
     }
 
@@ -251,7 +325,7 @@ async function processOneOrder() {
     // cart leak in CDP mode and crash-recovery double-adds).
     try {
       await cart.clearCart(page, { saveScreenshot });
-    } catch (e) {
+    } catch (e: any) {
       logger.warn({ err: e.message }, 'pre-run cart clear failed (continuing)');
     }
 
@@ -269,9 +343,9 @@ async function processOneOrder() {
     // the restaurant page loads with the correct address from the start, so
     // Grubhub never fires the "Outside of delivery range" modal that would
     // otherwise block the pill on the restaurant page. Pickup orders skip.
-    if (!isPickup && parsed.deliveryAddress) {
-      const pillOk = await setResidentAddressViaPill(page, parsed.deliveryAddress).catch(
-        (e) => {
+    if (!isPickup && deliveryAddress) {
+      const pillOk = await setResidentAddressViaPill(page, deliveryAddress).catch(
+        (e: any) => {
           logger.warn({ err: e.message }, 'setResidentAddressViaPill threw on homepage (continuing)');
           return false;
         },
@@ -288,11 +362,11 @@ async function processOneOrder() {
         await sendReviewAlert({
           severity: 'warn',
           title: 'Address swap failed',
-          reason: `Could not change Grubhub session address to "${parsed.deliveryAddress}". Pill click + Update did not register a verified address change.`,
+          reason: `Could not change Grubhub session address to "${deliveryAddress}". Pill click + Update did not register a verified address change.`,
           order: { order_id: order.id, account: account.id, restaurant_name: parsed.store, max_total: parsed.maxTotal },
         });
         exitCode = 1;
-        return;
+        return exitCode;
       }
     }
 
@@ -320,7 +394,7 @@ async function processOneOrder() {
       logger.info({ ...toggleRes, wanted: parsed.orderType }, 'order type toggle verify (post-nav)');
     }
 
-    let menu = await scrapeMenu(page);
+    let menu = await scrapeMenu(page, { deep: false });
 
     // Out-of-range recovery. Grubhub sometimes loads the restaurant page with
     // the account's stale address instead of the one we set on the homepage,
@@ -328,17 +402,17 @@ async function processOneOrder() {
     // detects that modal, clicks "Change", and re-enters the resident address
     // (browser.js). Try it once on the restaurant page, then re-scrape. Skip
     // for pickup (no delivery address) and when we have no address to re-enter.
-    if (menu.count === 0 && menu.reason === 'out_of_range' && !isPickup && parsed.deliveryAddress) {
+    if (menu.count === 0 && menu.reason === 'out_of_range' && !isPickup && deliveryAddress) {
       logger.warn('out-of-range modal on restaurant page — retrying address via Change');
       await saveScreenshot(page, 'out-of-range-before-recovery');
-      const recovered = await setResidentAddressViaPill(page, parsed.deliveryAddress).catch((e) => {
+      const recovered = await setResidentAddressViaPill(page, deliveryAddress).catch((e: any) => {
         logger.warn({ err: e.message }, 'out-of-range recovery threw (continuing)');
         return false;
       });
       logger.info({ recovered }, 'out-of-range address recovery result');
       if (recovered) {
         await detectBlockers(page);
-        menu = await scrapeMenu(page);
+        menu = await scrapeMenu(page, { deep: false });
         logger.info({ count: menu.count, reason: menu.reason }, 'post-recovery rescrape');
       }
     }
@@ -352,13 +426,13 @@ async function processOneOrder() {
       await saveScreenshot(page, 'pickup-only-modal');
       if (isPickup) {
         logger.info('pickup-only modal on a pickup order — clicking "Switch to pickup"');
-        const switched = await switchToPickup(page).catch((e) => {
+        const switched = await switchToPickup(page).catch((e: any) => {
           logger.warn({ err: e.message }, 'switchToPickup threw (continuing)');
           return false;
         });
         if (switched) {
           await detectBlockers(page);
-          menu = await scrapeMenu(page);
+          menu = await scrapeMenu(page, { deep: false });
           logger.info({ count: menu.count, reason: menu.reason }, 'post-switch-to-pickup rescrape');
         }
       } else {
@@ -372,7 +446,7 @@ async function processOneOrder() {
           order: { order_id: order.id, account: account.id, restaurant_name: parsed.store, max_total: parsed.maxTotal },
         });
         exitCode = 1;
-        return;
+        return exitCode;
       }
     }
 
@@ -383,10 +457,10 @@ async function processOneOrder() {
     const shouldPreorder = parsed.targetTime || (menu.count === 0 && menu.reason === 'restaurant_closed' && allowPreorder);
     if (shouldPreorder) {
       logger.info({ targetTime: parsed.targetTime, menuCount: menu.count }, 'attempting preorder');
-      const pre = await tryPreorder(page, { saveScreenshot, targetTime: parsed.targetTime });
+      const pre = await tryPreorder(page, { saveScreenshot, targetTime: parsed.targetTime ?? undefined });
       logger.info({ pre }, 'preorder attempt result');
       if (pre.ok) {
-        menu = await scrapeMenu(page);
+        menu = await scrapeMenu(page, { deep: false });
         logger.info({ count: menu.count, picked: pre.picked }, 'post-preorder rescrape');
       }
     }
@@ -394,8 +468,8 @@ async function processOneOrder() {
     if (menu.count === 0) {
       await saveScreenshot(page, 'menu-empty');
       const visibleText = (menu.closedSignal && menu.closedSignal.text) || '';
-      let reason;
-      let title;
+      let reason: string;
+      let title: string;
       if (menu.reason === 'out_of_range') {
         reason = `Restaurant marked unorderable for this delivery address — check that the pill swap worked. Visible: "${visibleText.slice(0, 200)}"`;
         title = 'Restaurant out of delivery range (address may be wrong)';
@@ -415,7 +489,46 @@ async function processOneOrder() {
         order: { order_id: order.id, account: account.id, restaurant_name: parsed.store, max_total: parsed.maxTotal },
       });
       exitCode = 1;
-      return;
+      return exitCode;
+    }
+
+    // Phase 1b — SEARCH-FIRST item discovery. Instead of scrolling the whole
+    // menu up front, type each requested item into the restaurant's own search
+    // box, scrape the filtered results, and use those as the match candidates.
+    // The full deep scrape runs ONLY as a fallback when search finds nothing
+    // (e.g. the search box is missing or returns no cards). This is faster and
+    // more accurate than scraping the entire (often virtualized) menu.
+    try {
+      const searchItems = await searchMenuItems(page, items.map((i) => i.name));
+      if (searchItems.length) {
+        // Search results ARE the candidate set — nothing else. We do NOT fold in
+        // the whole menu: the point of searching is to narrow to the few cards
+        // the search returned and match against only those. Matching the
+        // requested item to the right one (by name/price) happens next in
+        // matchItemsBudgetAware over exactly these candidates.
+        const byName = new Map(searchItems.map((it) => [it.name.toLowerCase(), it]));
+        menu.items = Array.from(byName.values());
+        menu.count = menu.items.length;
+        logger.info(
+          { candidatesFromSearch: menu.count },
+          'menu candidates = in-page search results only (no full-menu scrape)',
+        );
+      } else {
+        // Fallback: search yielded nothing — do the full deep scroll-scrape.
+        logger.info('search returned no items — falling back to deep menu scrape');
+        const deepMenu = await scrapeMenu(page, { deep: true });
+        if (deepMenu.items && deepMenu.items.length) {
+          menu.items = deepMenu.items;
+          menu.count = deepMenu.count;
+        }
+      }
+    } catch (e: any) {
+      logger.warn({ err: e.message }, 'search-first discovery failed — falling back to deep scrape');
+      const deepMenu = await scrapeMenu(page, { deep: true }).catch(() => null);
+      if (deepMenu && deepMenu.items && deepMenu.items.length) {
+        menu.items = deepMenu.items;
+        menu.count = deepMenu.count;
+      }
     }
 
     // Phase 2 — two-pass budget-aware matching:
@@ -428,7 +541,9 @@ async function processOneOrder() {
     const match = await claudeClient.matchItemsBudgetAware({
       requestedItems: items.map((i) => ({ name: i.name, qty: i.qty })),
       menu: { items: menu.items },
-      maxTotal: parsed.maxTotal,
+      // parsed.maxTotal is number|null; the original code passed it through
+      // as-is (null when the notes carried no cap). Preserve that exactly.
+      maxTotal: parsed.maxTotal as number,
       confidenceThreshold: CONFIDENCE_THRESHOLD,
     });
 
@@ -438,23 +553,63 @@ async function processOneOrder() {
     );
 
     if (!match.withinBudget) {
-      const attemptsStr = (match.attempts || [])
-        .map((a) => `${a.label}: $${a.total} — ${a.picks.join('; ')}`)
-        .join(' | ');
-      const reason =
-        `Budget-aware match failed: ${match.reason}` +
-        (attemptsStr ? ` Attempts: ${attemptsStr}` : '');
-      await sheetClient.writeReview(order._rowNumber, reason.slice(0, 500));
+      // A budget mismatch MUST always land in needs-review — never a hard
+      // "Order failed". So build the message defensively: start with safe
+      // fallbacks, and if anything in the (data-dependent) message building
+      // throws, keep the fallbacks instead of letting the error escape to the
+      // outer catch (which would mark the order Failed).
+      let sheetReason = (match.reason || 'Items could not be matched within budget') + ' — needs review';
+      let slackReason = sheetReason;
+      try {
+        const maxTotal = Number(parsed.maxTotal) || 0;
+        // Cheapest combo Grubhub could actually build (one match per requested item).
+        const cheapest = (match.attempts || []).find((a) => a.label === 'cheapest-available')
+          || (match.attempts || []).slice().sort((a, b) => a.total - b.total)[0];
+        const cheapestTotal = cheapest ? Number(cheapest.total) : null;
+        const over = cheapestTotal != null ? (cheapestTotal - maxTotal) : null;
+
+        // Cheapest single candidate per requested item, for an at-a-glance breakdown.
+        const breakdown = (match.rankedRaw || [])
+          .map((row) => {
+            // Sort cheapest-first, treating a missing/null price as +Infinity so
+            // priced candidates win and a null-priced one never lands as "best".
+            const best = (row.candidates || [])
+              .slice()
+              .sort((a, b) => (a.matched_price ?? Infinity) - (b.matched_price ?? Infinity))[0];
+            if (!best) return `• ${row.requested} → no match found`;
+            const priceStr = best.matched_price != null ? `$${best.matched_price.toFixed(2)}` : 'price n/a';
+            return `• ${row.requested} → ${best.matched_name} (${priceStr})`;
+          })
+          .join('\n');
+
+        sheetReason =
+          `Over budget: cheapest combo $${cheapestTotal != null ? cheapestTotal.toFixed(2) : '?'} ` +
+          `exceeds max $${maxTotal.toFixed(2)}` +
+          (over != null ? ` (over by $${over.toFixed(2)})` : '');
+
+        slackReason =
+          `This order can't fit the $${maxTotal.toFixed(2)} budget.\n` +
+          (cheapestTotal != null
+            ? `Cheapest possible combo is *$${cheapestTotal.toFixed(2)}* — over by *$${over!.toFixed(2)}*.\n\n`
+            : '\n') +
+          `*Best price per item:*\n${breakdown}\n\n` +
+          `_To proceed: raise the max total or remove/swap an item._`;
+      } catch (msgErr: any) {
+        logger.warn({ err: msgErr.message }, 'budget-review message build failed — using safe fallback reason (still needs-review, not failed)');
+      }
+
+      await sheetClient.writeReview(order._rowNumber, String(sheetReason).slice(0, 500)).catch((e: any) => {
+        logger.warn({ err: e.message }, 'writeReview failed for budget mismatch');
+      });
       lockedRow = null;
       await sendReviewAlert({
         severity: 'warn',
-        title: 'Items could not be matched within budget',
-        reason,
+        title: '🛑 Order over budget — needs review',
+        reason: slackReason,
         order: { order_id: order.id, account: account.id, restaurant_name: parsed.store, max_total: parsed.maxTotal },
-        extra: { rankedRaw: match.rankedRaw, attempts: match.attempts },
-      });
+      }).catch(() => {});
       exitCode = 1;
-      return;
+      return exitCode;
     }
 
     await detectBlockers(page);
@@ -483,7 +638,7 @@ async function processOneOrder() {
     if (addRes.skipped.length) {
       const reason =
         `Phase 3: ${addRes.skipped.length} item(s) could not be added — ` +
-        addRes.skipped.map((s) => `${s.name} (${s.reason})`).join('; ');
+        addRes.skipped.map((s: any) => `${s.name} (${s.reason})`).join('; ');
       await sheetClient.writeReview(order._rowNumber, reason.slice(0, 500));
       lockedRow = null;
       await sendReviewAlert({
@@ -494,7 +649,7 @@ async function processOneOrder() {
         extra: addRes,
       });
       exitCode = 1;
-      return;
+      return exitCode;
     }
 
     // Phase 3.5 — cart subtotal. Enforce as a hard cap only when
@@ -520,7 +675,7 @@ async function processOneOrder() {
         order: { order_id: order.id, account: account.id, restaurant_name: parsed.store, max_total: parsed.maxTotal },
       });
       exitCode = 1;
-      return;
+      return exitCode;
     }
     if (subtotal != null && parsed.maxTotal != null && subtotal > parsed.maxTotal) {
       logger.warn(
@@ -541,7 +696,7 @@ async function processOneOrder() {
       await sheetClient.writeReview(order._rowNumber, `Phase 4: could not read checkout total at ${reviewUrl}`);
       lockedRow = null;
       exitCode = 1;
-      return;
+      return exitCode;
     }
     if (
       MAX_TOTAL_BASIS === 'all_in' &&
@@ -559,7 +714,7 @@ async function processOneOrder() {
         order: { order_id: order.id, account: account.id, restaurant_name: parsed.store, max_total: parsed.maxTotal },
       });
       exitCode = 1;
-      return;
+      return exitCode;
     }
 
     // Phase 5 — snapshot the review page (address / payment / tip) for the human approver.
@@ -568,54 +723,116 @@ async function processOneOrder() {
     logger.info({ snap }, 'phase 5: review snapshot captured');
     await sheetClient.appendInternalNote(order._rowNumber, `PHASE5_OK subtotal=${subtotal ?? '?'} total=${checkoutTotal} basis=${MAX_TOTAL_BASIS}`).catch(() => {});
 
-    if (DRY_RUN) {
-      const summary =
-        `DRY-RUN reached checkout review. ${addRes.added.length} item(s) added, ` +
-        `subtotal=$${subtotal ?? '?'}, total=$${checkoutTotal}/$${parsed.maxTotal ?? '∞'}. ` +
-        `Did NOT click Place Order. Review URL: ${reviewUrl}`;
-      logger.info({ summary }, 'dry-run complete');
-      await sendReviewAlert({
-        severity: 'info',
-        title: 'DRY-RUN reached checkout review (Place Order not clicked)',
-        reason: summary,
-        order: { order_id: order.id, account: account.id, restaurant_name: parsed.store, max_total: parsed.maxTotal },
-        extra: { added: addRes.added, snap },
-      });
-      // Write a non-ready state so the loop advances to the next row instead
-      // of re-picking this one. Reset column E to blank to retry a row.
-      await sheetClient.unlockRow(order._rowNumber, summary, 'dry-run-done');
-      lockedRow = null;
-      // eslint-disable-next-line no-console
-      console.log('\n' + summary + '\n');
-      return;
-    }
-
     // ---- Phase 5b: fill contact + special instructions ----
-    // Contact info on the review page is often pre-filled with the saved
-    // account's name/phone. We overwrite with the row's first/last/phone so
-    // the order shows the resident, not the bot account. Special instructions
-    // come from the parsed notes.
+    // Done BEFORE the dry-run snapshot so the approval card (dry-run OR real)
+    // shows the RESIDENT's name/phone from the sheet, not the bot account's
+    // saved contact. Contact info on the review page is often pre-filled with
+    // the account's name/phone; we overwrite it with the row's values.
+    // Declared outside the try so the post-fill confirmation wait below can
+    // read the same values (a `const` inside try would be out of scope there).
+    let contact: {
+      firstName: string | undefined;
+      lastName: string | undefined;
+      phone: string | undefined;
+      unit: string;
+      specialInstructions: string;
+    } | null = null;
     try {
       // The SHEET ROW columns (first_name/last_name/cell_phone) are the source
       // of truth for the resident — they MUST win over anything parsed from the
       // notes or pre-filled by the bot's Grubhub account, otherwise the order
       // shows the bot account's name/phone. Only fall back to parsed values when
       // a sheet column is blank.
-      const contact = {
+      contact = {
         firstName: order.first_name || parsed.customerFirstName || parsed.residentFirstName,
         lastName: order.last_name || parsed.customerLastName || parsed.residentLastName,
-        phone: order.cell_phone || parsed.customerPhone || parsed.bookingPhone,
+        // Phone: use the notes "Temporary phone to use for booking" line, NOT
+        // the resident's real cell_phone column. The booking phone is the number
+        // the order should be placed under; cell_phone is only a last-resort
+        // fallback if the notes line is missing.
+        phone: parsed.bookingPhone || parsed.customerPhone || order.cell_phone,
+        // Unit/apt → the checkout "Apt., suite, floor" field (#address2).
+        unit: residentUnit,
         specialInstructions: parsed.specialInstructions || parsed.driverNotes,
       };
       logger.info(
-        { firstName: contact.firstName, lastName: contact.lastName, phone: contact.phone, source: 'sheet-first' },
+        { firstName: contact.firstName, lastName: contact.lastName, phone: contact.phone, unit: contact.unit, source: 'sheet-first' },
         'filling checkout contact from sheet row',
       );
       await cart.fillCheckoutContact(page, contact);
-    } catch (e) {
+    } catch (e: any) {
       logger.warn({ err: e.message }, 'fillCheckoutContact threw (continuing — fields may already be set)');
     }
+    // Wait until the SPA has actually committed the just-filled fields before
+    // we snapshot — otherwise the approval screenshot can race the last write.
+    // Poll the real input values instead of guessing with a fixed sleep: names
+    // must equal what we wrote; phone/unit just need to be non-empty (the SPA
+    // reformats phone, so an exact match would be brittle). Bounded so a
+    // skipped/optional field never hangs the run.
+    if (contact) {
+      await page.waitForFunction(
+        (c: { firstName?: string; lastName?: string; phone?: string; unit?: string }) => {
+          const val = (sel: string) => {
+            const el = document.querySelector(sel) as HTMLInputElement | null;
+            return el ? String(el.value || '').trim() : '';
+          };
+          const okName = (sel: string, want?: string) =>
+            !want || val(sel).toLowerCase() === String(want).trim().toLowerCase();
+          const okFilled = (sel: string, want?: string) => !want || val(sel).length > 0;
+          return (
+            okName('#firstName', c.firstName) &&
+            okName('#lastName', c.lastName) &&
+            okFilled('#phone', c.phone) &&
+            okFilled('#address2', c.unit)
+          );
+        },
+        { firstName: contact.firstName, lastName: contact.lastName, phone: contact.phone, unit: contact.unit },
+        { timeout: 4000 },
+      ).catch(() => {
+        logger.warn('contact fields did not confirm within 4s — snapshotting anyway');
+      });
+    }
     await saveScreenshot(page, 'phase5b-after-contact-fill');
+
+    if (DRY_RUN) {
+      const summary =
+        `DRY-RUN reached checkout review. ${addRes.added.length} item(s) added, ` +
+        `subtotal=$${subtotal ?? '?'}, total=$${checkoutTotal}/$${parsed.maxTotal ?? '∞'}. ` +
+        `Did NOT click Place Order. Review URL: ${reviewUrl}`;
+      logger.info({ summary }, 'dry-run complete');
+      // Post the SAME rich approval card (screenshot + Accept/Reject buttons)
+      // that a real order would get, so you can verify the Slack UX during a
+      // dry run. dryRun:true means it's clearly labelled a preview, registers
+      // no waiter, and places no order whichever button is clicked.
+      try {
+        const { sendCheckoutApproval } = require('./review/slackApproval');
+        const previewShot = await saveScreenshot(page, 'phase6-approval-snapshot');
+        await sendCheckoutApproval({
+          orderId: order.id,
+          restaurantName: parsed.storeName || parsed.store,
+          items,
+          subtotal,
+          total: checkoutTotal,
+          maxTotal: parsed.maxTotal,
+          deliveryAddress,
+          account: account.id,
+          screenshotPath: previewShot,
+          rowNumber: order._rowNumber,
+          dryRun: true,
+        });
+      } catch (e: any) {
+        logger.warn({ err: e.message }, 'dry-run approval preview post failed (continuing)');
+      }
+      // Write a non-ready state so the loop advances to the next row instead
+      // of re-picking this one. Reset column E to blank to retry a row.
+      await sheetClient.unlockRow(order._rowNumber, summary, 'dry-run-done');
+      lockedRow = null;
+      // eslint-disable-next-line no-console
+      console.log('\n' + summary + '\n');
+      return exitCode;
+    }
+
+    // (Phase 5b contact fill now runs above, before the dry-run snapshot.)
 
     // Advance the checkout "gather" step → review/payment. proceedToCheckout
     // can land on /checkout/.../gather ("Does everything below look correct?"),
@@ -626,8 +843,19 @@ async function processOneOrder() {
       const gatherRes = await cart.submitCheckoutGather(page, { addressLabel: 'home' });
       logger.info({ gatherRes }, 'phase 5b: submitted checkout gather (advancing to review)');
       await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-      await page.waitForTimeout(800);
-    } catch (e) {
+      // Wait for the actual signal we care about — landing on the
+      // /checkout/.../{gather,review} page — instead of a fixed sleep. The URL
+      // gate just below depends on exactly this; polling it here removes the
+      // race where the screenshot is taken mid-navigation. Bounded so a stuck
+      // navigation falls through to the gate's explicit failure handling.
+      await page.waitForFunction(
+        () => /\/checkout\/[^/]+\/(gather|review)/i.test(location.href),
+        undefined,
+        { timeout: 8000 },
+      ).catch(() => {
+        logger.warn('did not reach gather/review URL within 8s after gather submit');
+      });
+    } catch (e: any) {
       logger.warn({ err: e.message }, 'submitCheckoutGather threw (continuing)');
     }
     await saveScreenshot(page, 'phase5b-after-gather-submit');
@@ -644,17 +872,24 @@ async function processOneOrder() {
       );
       lockedRow = null;
       exitCode = 1;
-      return;
+      return exitCode;
     }
 
     // ---- Phase 6: Slack approval gate ----
-    const { sendCheckoutApproval, waitForReactionApproval, postFollowUp } =
+    const { sendCheckoutApproval, waitForButtonApproval, postFollowUp } =
       require('./review/slackApproval');
-    const approvalShotPath = await saveScreenshot(page, 'phase6-approval-snapshot');
+    // Full-page so the human approver sees the ENTIRE order (items, totals,
+    // address, fees) in one image, not just the top viewport.
+    const approvalShotPath = await saveScreenshot(page, 'phase6-approval-snapshot', { fullPage: true });
     const send = await sendCheckoutApproval({
       orderId: order.id,
       restaurantName: parsed.storeName || parsed.store,
+      items,
+      subtotal,
       total: checkoutTotal,
+      maxTotal: parsed.maxTotal,
+      deliveryAddress,
+      account: account.id,
       screenshotPath: approvalShotPath,
       rowNumber: order._rowNumber,
     });
@@ -662,7 +897,7 @@ async function processOneOrder() {
       await sheetClient.writeFailure(order._rowNumber, `Slack approval send failed: ${send.error || 'unknown'}`);
       lockedRow = null;
       exitCode = 1;
-      return;
+      return exitCode;
     }
     await sheetClient.appendInternalNote(
       order._rowNumber,
@@ -671,7 +906,7 @@ async function processOneOrder() {
 
     const approvalTimeoutMs =
       Math.max(60_000, parseInt(process.env.APPROVAL_TIMEOUT_MS || '900000', 10)); // default 15 min
-    const decision = await waitForReactionApproval({
+    const decision = await waitForButtonApproval({
       channel: send.channel,
       ts: send.ts,
       timeoutMs: approvalTimeoutMs,
@@ -689,7 +924,7 @@ async function processOneOrder() {
       );
       lockedRow = null;
       logger.info({ rowNumber: order._rowNumber, userId: decision.userId }, 'order rejected by reviewer');
-      return;
+      return exitCode;
     }
     if (decision.decision === 'timeout' || !decision.ok) {
       await postFollowUp({
@@ -703,14 +938,14 @@ async function processOneOrder() {
       );
       lockedRow = null;
       logger.warn({ rowNumber: order._rowNumber }, 'approval timed out — order not placed');
-      return;
+      return exitCode;
     }
 
     // ---- Phase 7: Place Order ----
     logger.info({ userId: decision.userId }, 'approval received, clicking Place Order');
     await sheetClient.appendInternalNote(
       order._rowNumber,
-      `APPROVED_BY ${decision.userId} (${decision.emoji})`,
+      `APPROVED_BY ${decision.userId} (${decision.userName || 'button'})`,
     ).catch(() => {});
 
     // Grubhub's review page can drift state if the approval took a few minutes.
@@ -719,7 +954,15 @@ async function processOneOrder() {
       // approved quickly — no need to reload
     } else {
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-      await page.waitForTimeout(800);
+      // Wait for the Place Order button to actually re-render after the reload,
+      // instead of a fixed sleep — that's the precise signal placeOrder needs.
+      // Bounded; placeOrder re-checks and retries the click if it's not ready.
+      await page
+        .waitForSelector(
+          '[data-testid="place-order-button"], [data-testid="place-order"], button:has-text("Place order"), button:has-text("Place Order")',
+          { state: 'visible', timeout: 8000 },
+        )
+        .catch(() => logger.warn('Place Order button not visible within 8s after reload — placeOrder will retry'));
     }
 
     const placed = await cart.placeOrder(page);
@@ -736,7 +979,7 @@ async function processOneOrder() {
       );
       lockedRow = null;
       exitCode = 1;
-      return;
+      return exitCode;
     }
 
     // ---- Phase 8: success writeback ----
@@ -755,7 +998,7 @@ async function processOneOrder() {
       { rowNumber: order._rowNumber, grubhubOrderId: placed.grubhubOrderId, total: checkoutTotal },
       'order placed successfully',
     );
-  } catch (err) {
+  } catch (err: any) {
     logger.error({ err: err.message, code: err.code, stack: err.stack }, 'order failed');
     if (lockedRow) {
       await sheetClient.writeFailure(lockedRow, err.message).catch(() => {});
@@ -764,6 +1007,15 @@ async function processOneOrder() {
     // human to re-sign in instead of churning through every row in the queue.
     exitCode = err.code === 'SESSION_EXPIRED' ? 3 : 1;
   } finally {
+    // One tab per order: close the tab we opened so it doesn't accumulate in
+    // the CDP Chrome. Leftover Grubhub tabs each carry 30+ tracking iframes, and
+    // the next run's connectOverCDP has to enumerate them all — that pile-up is
+    // what causes the 120s "connectOverCDP timeout". Closing here keeps Chrome
+    // light and also drops the per-tab cart/localStorage state between orders.
+    if (page) {
+      await page.close().catch(() => {});
+      logger.info('closed per-order tab');
+    }
     // CDP attach: just disconnect (browser.close() on a connectOverCDP
     // handle won't kill the user's Chrome, but be explicit about intent).
     if (browser) {
@@ -789,12 +1041,12 @@ async function processOneOrder() {
 //   - SESSION_EXPIRED (Chrome got signed out) → sleep 60s. Avoids burning
 //     through the whole queue marking every row failed before the human can
 //     re-sign in. Hold for the user to act.
-async function cmdRun() {
+async function cmdRun(): Promise<void> {
   const pollMs = Math.max(5000, parseInt(process.env.POLL_INTERVAL_MS || '300000', 10));
   logger.info({ pollMs }, 'starting run loop (Ctrl+C to stop)');
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const code = await processOneOrder().catch((err) => {
+    const code = await processOneOrder().catch((err: any) => {
       logger.error({ err: err.message, stack: err.stack }, 'processOneOrder threw unexpectedly');
       return 1;
     });
@@ -813,13 +1065,15 @@ async function cmdRun() {
 // /trigger the moment a new row lands, kicking off order processing instantly
 // instead of waiting for the next poll. A fallback poll still runs as a safety
 // net in case a webhook is missed (network blip, tunnel down).
-async function cmdServe() {
-  const { startServer } = require('./server');
+async function cmdServe(): Promise<void> {
+  // Lazy dynamic import: server.ts imports this module, so a top-level import
+  // would create a circular import. Resolve it only when serve runs.
+  const { startServer } = await import('./server');
   await startServer({ processOneOrder });
   // Keep the process alive; startServer holds the HTTP listener open.
 }
 
-async function cmdQueueTest() {
+async function cmdQueueTest(): Promise<void> {
   const url = process.env.TEST_URL
     || 'https://www.grubhub.com/restaurant/the-melt---925-market-sf-925-market-st-san-francisco/2028596';
   const store = process.env.TEST_STORE || 'The Melt - 925 Market SF';
@@ -846,13 +1100,20 @@ async function cmdQueueTest() {
   process.exit(0);
 }
 
-async function main() {
+async function main(): Promise<void> {
   const [, , cmd, ...rest] = process.argv;
+  // Single-instance guard for any command that processes orders. Two bots
+  // running at once would each have their own in-memory drain lock and could
+  // work different sheet rows in parallel (the row-60/61 overlap).
+  const ORDER_COMMANDS = new Set(['order', 'run', 'serve']);
+  if (ORDER_COMMANDS.has(cmd)) {
+    require('./util/singleInstance').acquire(cmd);
+  }
   switch (cmd) {
     case 'check':
       return cmdCheck();
     case 'login':
-      return cmdLogin(rest[0]);
+      return cmdLogin();
     case 'order':
       return cmdOrder();
     case 'run':
@@ -868,12 +1129,12 @@ async function main() {
   }
 }
 
-module.exports = { processOneOrder };
+export { processOneOrder };
 
 // Only run the CLI when invoked directly (node src/index.js ...). When this
 // module is require()'d (e.g. by src/server.js), skip the CLI dispatch.
 if (require.main === module) {
-  main().catch((err) => {
+  main().catch((err: any) => {
     logger.error({ err: err.message, stack: err.stack }, 'fatal');
     process.exit(1);
   });

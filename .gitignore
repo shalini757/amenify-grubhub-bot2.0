@@ -7,3 +7,8 @@ chrome-profile/
 dist/
 build/
 .DS_Store
+.bot-instance.lock
+
+# Debug artifacts and local tooling — not source
+screenshots/
+.claude/

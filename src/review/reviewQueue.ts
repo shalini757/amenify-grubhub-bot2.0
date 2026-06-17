@@ -1,17 +1,47 @@
-'use strict';
+import { logger } from '../logger';
 
-const { logger } = require('../logger');
-
-const PII_FIELDS = new Set([
+const PII_FIELDS = new Set<string>([
   'customer_name',
   'customer_phone',
   'delivery_address',
   'delivery_instructions',
 ]);
 
-function scrubPii(order) {
+interface OrderLike {
+  [key: string]: unknown;
+}
+
+interface BuildPayloadArgs {
+  severity?: string;
+  title: string;
+  reason?: string;
+  order?: OrderLike | null;
+  extra?: unknown;
+}
+
+interface SlackPayload {
+  text: string;
+  blocks: unknown[];
+}
+
+interface SendReviewAlertArgs {
+  severity?: string;
+  title: string;
+  reason?: string;
+  order?: OrderLike | null;
+  extra?: unknown;
+}
+
+interface SendReviewAlertResult {
+  sent: boolean;
+  reason?: string;
+  status?: number;
+  error?: string;
+}
+
+function scrubPii(order: OrderLike | null | undefined): OrderLike {
   if (!order || typeof order !== 'object') return {};
-  const out = {};
+  const out: OrderLike = {};
   for (const [k, v] of Object.entries(order)) {
     if (PII_FIELDS.has(k)) continue;
     out[k] = v;
@@ -19,7 +49,7 @@ function scrubPii(order) {
   return out;
 }
 
-function buildPayload({ severity = 'warn', title, reason, order, extra }) {
+function buildPayload({ severity = 'warn', title, reason, order, extra }: BuildPayloadArgs): SlackPayload {
   const scrubbed = scrubPii(order || {});
   const fields = [
     { type: 'mrkdwn', text: `*Order ID:* ${scrubbed.order_id || 'n/a'}` },
@@ -40,7 +70,7 @@ function buildPayload({ severity = 'warn', title, reason, order, extra }) {
   };
 }
 
-async function sendReviewAlert({ severity = 'warn', title, reason, order, extra } = {}) {
+async function sendReviewAlert({ severity = 'warn', title, reason, order, extra }: SendReviewAlertArgs = {} as SendReviewAlertArgs): Promise<SendReviewAlertResult> {
   if ((process.env.SLACK_ALERTS || '').toLowerCase() === 'off') {
     logger.info({ title }, 'SLACK_ALERTS=off — skipping review alert');
     return { sent: false, reason: 'disabled' };
@@ -65,9 +95,10 @@ async function sendReviewAlert({ severity = 'warn', title, reason, order, extra 
     logger.info({ title }, 'review alert sent');
     return { sent: true };
   } catch (err) {
-    logger.warn({ err: err.message }, 'slack webhook send failed — continuing');
-    return { sent: false, error: err.message };
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn({ err: message }, 'slack webhook send failed — continuing');
+    return { sent: false, error: message };
   }
 }
 
-module.exports = { sendReviewAlert, scrubPii };
+export { sendReviewAlert, scrubPii };

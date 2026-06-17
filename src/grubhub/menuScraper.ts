@@ -1,6 +1,36 @@
-'use strict';
+/// <reference lib="dom" />
 
-const { logger } = require('../logger');
+import { logger } from '../logger';
+import type { Page, Locator, ElementHandle } from 'playwright';
+
+export type MenuItem = {
+  name: string;
+  price: number | null;
+  description?: string;
+  category?: string;
+  matchedQuery?: string;
+};
+
+type ClosedSignal = { hit: string; text: string };
+
+export type ScrapeResult = {
+  items: MenuItem[];
+  count: number;
+  selector: string | null;
+  reason?: string;
+  classification?: string;
+  shallow?: boolean;
+  closedSignal?: ClosedSignal;
+};
+
+type TargetTime = { minutesFromMidnight: number; raw?: string };
+
+type PreorderOptions = {
+  saveScreenshot?: (page: Page, name: string) => Promise<unknown>;
+  targetTime?: TargetTime;
+};
+
+type PreorderResult = { ok: boolean; reason?: string; picked?: string | null };
 
 // Grubhub mangles class names, so we try several selector candidates and
 // fall back to scanning text-rich containers. The first run against a real
@@ -32,7 +62,7 @@ const PRICE_ONLY_RE = /^\s*\$?\s*\d+(?:\.\d{1,2})?\s*\+?\s*$/;
 // Scrolls in steps and waits for item count to stabilize. Lazy-loaded menu
 // sections render as you scroll past them; a fixed-distance scroll can miss
 // items further down the page.
-async function scrollUntilStable(page, itemSelector, maxIterations = 30) {
+async function scrollUntilStable(page: Page, itemSelector: string, maxIterations = 30): Promise<number> {
   let stableCount = 0;
   let lastCount = -1;
   for (let i = 0; i < maxIterations; i++) {
@@ -54,7 +84,7 @@ async function scrollUntilStable(page, itemSelector, maxIterations = 30) {
   return lastCount;
 }
 
-function parseFromInnerText(text) {
+function parseFromInnerText(text: string | null | undefined): MenuItem | null {
   const lines = String(text || '')
     .split('\n')
     .map((s) => s.trim())
@@ -66,8 +96,9 @@ function parseFromInnerText(text) {
   const nameIdx = lines.findIndex((l) => !PRICE_ONLY_RE.test(l));
   if (nameIdx === -1) return null;
   const name = lines[nameIdx];
+  if (name == null) return null;
   const priceMatch = String(text).match(/\$(\d+(?:\.\d{1,2})?)/);
-  const price = priceMatch ? parseFloat(priceMatch[1]) : null;
+  const price = priceMatch && priceMatch[1] != null ? parseFloat(priceMatch[1]) : null;
   const description = lines
     .filter((_, i) => i !== nameIdx)
     .join(' ')
@@ -76,12 +107,14 @@ function parseFromInnerText(text) {
   return { name, price, description };
 }
 
-async function collectVisibleItems(page, selector) {
+async function collectVisibleItems(page: Page, selector: string): Promise<MenuItem[]> {
   await scrollUntilStable(page, selector);
-  const found = await page
-    .$$eval(selector, (els) => els.map((el) => (el.innerText || '').trim()))
+  const found: string[] = await page
+    .$$eval(selector, (els) => els.map((el) => ((el as HTMLElement).innerText || '').trim()))
     .catch(() => []);
-  return found.map(parseFromInnerText).filter((x) => x && x.name);
+  return found
+    .map(parseFromInnerText)
+    .filter((x): x is MenuItem => !!x && !!x.name);
 }
 
 // Accumulating scroll-and-collect: Grubhub virtualizes its menu list,
@@ -89,16 +122,20 @@ async function collectVisibleItems(page, selector) {
 // scroll-to-bottom yields only the items still in viewport (~5 on
 // Taco Cabana). Instead, scroll incrementally, harvesting innerText of
 // whatever menu-item nodes are currently rendered, and dedupe by name.
-async function collectAllItemsByAccumulating(page, selector, { maxScrolls = 40, scrollStep = 900 } = {}) {
-  const seen = new Map();
+async function collectAllItemsByAccumulating(
+  page: Page,
+  selector: string,
+  { maxScrolls = 40, scrollStep = 900 }: { maxScrolls?: number; scrollStep?: number } = {},
+): Promise<MenuItem[]> {
+  const seen = new Map<string, MenuItem>();
   let stableTicks = 0;
   let lastSize = -1;
   await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
   await page.waitForTimeout(120);
 
   for (let i = 0; i < maxScrolls; i++) {
-    const got = await page
-      .$$eval(selector, (els) => els.map((el) => (el.innerText || '').trim()))
+    const got: string[] = await page
+      .$$eval(selector, (els) => els.map((el) => ((el as HTMLElement).innerText || '').trim()))
       .catch(() => []);
     for (const text of got) {
       const item = parseFromInnerText(text);
@@ -122,18 +159,30 @@ async function collectAllItemsByAccumulating(page, selector, { maxScrolls = 40, 
   return Array.from(seen.values());
 }
 
-async function scrapeMenu(page) {
-  // 8s is enough on a hot SPA — the page has already had time to render
-  // by the time we get here (the dry-run waits for menu items first).
-  await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+async function scrapeMenu(page: Page, { deep = true }: { deep?: boolean } = {}): Promise<ScrapeResult> {
+  // Wait for the menu to be ACTIONABLE — item cards mounted OR a blocker
+  // (closed/out-of-range/pickup/schedule) signal — and return the instant that
+  // is true. We do NOT wait on networkidle: Grubhub's ad/tracking requests
+  // never go idle, so the old `networkidle` wait always burned the full 8s on
+  // every page even when the menu had already rendered in ~1s.
+  await page
+    .waitForFunction(() => {
+      const hasItems = document.querySelector(
+        '[data-testid="restaurant-menu-item"], [data-testid^="Item-"], [data-testid*="menu-item"], a[href*="/menuItem/"]',
+      );
+      const txt = (document.body.innerText || '').toLowerCase();
+      const blocker = /delivery range|pickup[- ]only|location is pickup|not taking orders|currently closed|no longer on grubhub|schedule (my )?order/.test(txt);
+      return !!hasItems || blocker;
+    }, { timeout: 8000 })
+    .catch(() => {});
 
   // Detect the "restaurant not taking orders right now" state explicitly.
   // Grubhub renders an empty menu region + a carousel of alternative
   // restaurants when the place is closed / paused / outside hours. We
   // need to distinguish this from a real selector mismatch so the human
   // review queue can route it differently (retry later vs. fix code).
-  const closedSignal = await page
-    .evaluate(() => {
+  const closedSignal: ClosedSignal | null = await page
+    .evaluate((): ClosedSignal | null => {
       const sels = [
         '[data-testid="unorderable-menu-prompt"]',
         '[data-testid="unorderable-menu-prompt-body"]',
@@ -141,22 +190,22 @@ async function scrapeMenu(page) {
         '[data-testid="closed-restaurant-message"]',
       ];
       for (const s of sels) {
-        const el = document.querySelector(s);
+        const el = document.querySelector(s) as HTMLElement | null;
         if (el) return { hit: s, text: (el.innerText || '').slice(0, 240) };
       }
       // Auto-opened "Schedule my order" modal — Grubhub fires this when a
       // restaurant is currently closed but accepts preorders. The modal
       // blocks the menu so any items the scraper finds behind/around it
       // are unreliable. Treat as closed so the preorder flow runs.
-      const visible = (el) => {
+      const visible = (el: Element | null): boolean => {
         if (!el) return false;
         const r = el.getBoundingClientRect();
         const s = window.getComputedStyle(el);
         return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
       };
-      for (const dlg of document.querySelectorAll('[role="dialog"], [aria-modal="true"]')) {
+      for (const dlg of Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]'))) {
         if (!visible(dlg)) continue;
-        const t = (dlg.innerText || '').trim();
+        const t = ((dlg as HTMLElement).innerText || '').trim();
         // "This location is pickup-only" — Grubhub blocks the menu with a modal
         // offering "Switch to pickup" / "Find delivery nearby". Detect it so the
         // caller can switch to pickup (when the order wants pickup) or route a
@@ -218,7 +267,7 @@ async function scrapeMenu(page) {
     };
   }
 
-  let winningSelector = null;
+  let winningSelector: string | null = null;
   for (const sel of SELECTORS) {
     const n = await page.$$eval(sel, (els) => els.length).catch(() => 0);
     if (n > 0) {
@@ -227,26 +276,44 @@ async function scrapeMenu(page) {
     }
   }
 
-  let items = [];
+  let items: MenuItem[] = [];
   if (!winningSelector) {
     logger.warn('no menu-item selector matched anything on this page');
     return { items: [], count: 0, selector: null, reason: 'no_selector_match' };
   }
 
+  // Shallow mode: the menu is present and NOT blocked (closed/out-of-range/
+  // pickup were ruled out above). Return quickly without the heavy category-
+  // walk / scroll accumulation. The caller drives item discovery via the
+  // in-page search box (searchMenuItems) instead, and only falls back to a
+  // deep scrape if search finds nothing. count uses the matched element count
+  // so a present menu never looks "empty".
+  if (!deep) {
+    const elCount = await page.$$eval(winningSelector, (els) => els.length).catch(() => 0);
+    const quick: string[] = await page
+      .$$eval(winningSelector, (els) => els.map((el) => ((el as HTMLElement).innerText || '').trim()))
+      .catch(() => []);
+    const quickItems = quick
+      .map(parseFromInnerText)
+      .filter((x): x is MenuItem => !!x && !!x.name);
+    logger.info({ winningSelector, elCount, parsed: quickItems.length }, 'menu scrape (shallow — search will drive discovery)');
+    return { items: quickItems, count: elCount, selector: winningSelector, shallow: true };
+  }
+
   // Discover category tabs in the sidebar nav, if any.
-  const categories = await page
+  const categories: { testid: string | null; name: string }[] = await page
     .$$eval(CATEGORY_SELECTOR, (els) =>
       els.map((el) => ({
         testid: el.getAttribute('data-testid'),
-        name: (el.innerText || '').trim().split('\n')[0],
+        name: ((el as HTMLElement).innerText || '').trim().split('\n')[0] || '',
       })),
     )
     .catch(() => []);
 
   // Accumulate items into a name-keyed map so dedupe happens inline and we
   // can early-stop scrolling the moment new items stop appearing.
-  const itemsByName = new Map();
-  const addText = (text, category) => {
+  const itemsByName = new Map<string, MenuItem>();
+  const addText = (text: string, category?: string): void => {
     const it = parseFromInnerText(text);
     if (!it || !it.name) return;
     const key = it.name.toLowerCase();
@@ -273,8 +340,8 @@ async function scrapeMenu(page) {
       let stable = 0;
       let prevSize = itemsByName.size;
       for (let s = 0; s < 8; s++) {
-        const got = await page
-          .$$eval(winningSelector, (els) => els.map((el) => (el.innerText || '').trim()))
+        const got: string[] = await page
+          .$$eval(winningSelector, (els) => els.map((el) => ((el as HTMLElement).innerText || '').trim()))
           .catch(() => []);
         for (const text of got) addText(text, cat.name);
         if (itemsByName.size === prevSize) {
@@ -310,12 +377,115 @@ async function scrapeMenu(page) {
   return { items, count: items.length, selector: winningSelector };
 }
 
+// Each restaurant page has its own in-page search box
+// (data-testid="menu-search-input") that filters THIS restaurant's menu — not
+// a global Grubhub search. Typing a requested item name into it narrows the
+// menu to the relevant cards, which both (a) sidesteps list virtualization
+// that can hide items during a full scroll-scrape, and (b) gives the matcher
+// a focused candidate set per requested item.
+//
+// Returns a deduped array of { name, price, description, matchedQuery } across
+// all queries — same item shape as scrapeMenu so it can be merged straight in.
+async function searchMenuItems(
+  page: Page,
+  queries: string[],
+  { maxWaitMs = 5000 }: { maxWaitMs?: number } = {},
+): Promise<MenuItem[]> {
+  const SEARCH_SELECTORS = [
+    '#menu-search-input',
+    '[data-testid="menu-search-input"]',
+    'input[aria-label^="Search" i]',
+    'input[placeholder^="Search" i]',
+  ];
+  let input: Locator | null = null;
+  for (const sel of SEARCH_SELECTORS) {
+    const loc = page.locator(sel).first();
+    if (await loc.isVisible({ timeout: 1000 }).catch(() => false)) { input = loc; break; }
+  }
+  if (!input) {
+    logger.warn('searchMenuItems: no menu search input found — skipping search-based collection');
+    return [];
+  }
+
+  const seen = new Map<string, MenuItem>();
+  for (const raw of queries) {
+    const query = String(raw || '').trim();
+    if (!query) continue;
+    // Clear then type the requested item name; the SPA filters as you type.
+    await input.click({ timeout: 2000 }).catch(() => {});
+    await input.fill('').catch(() => {});
+    await input.fill(query).catch(() => {});
+
+    // Wait for the filtered results to actually render and settle — condition-
+    // based, NOT a blind sleep. A fixed wait either snapshots too early (0
+    // results → wrongly triggers a full-menu fallback) or wastes time. We poll
+    // until a menu-item selector has cards AND the count holds steady for two
+    // ticks (the SPA filters incrementally), capped by maxWaitMs.
+    let sel: string | null = null;
+    let lastCount = -1;
+    let stable = 0;
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+      let foundSel: string | null = null;
+      let count = 0;
+      for (const s of SELECTORS) {
+        const n = await page.$$eval(s, (els) => els.length).catch(() => 0);
+        if (n > 0) { foundSel = s; count = n; break; }
+      }
+      if (foundSel) {
+        sel = foundSel;
+        if (count === lastCount) { stable += 1; if (stable >= 2) break; }
+        else { stable = 0; lastCount = count; }
+      }
+      await page.waitForTimeout(200);
+    }
+    if (!sel) {
+      logger.info({ query }, 'searchMenuItems: no results rendered for query within wait');
+      continue;
+    }
+    // Collect ALL filtered cards, scrolling through them — the search keeps
+    // category headers and can spread matches down the whole page, so a single
+    // viewport snapshot would miss the exact item (e.g. the real "Grilled
+    // Shrimp" entrée sitting below a salad/bowl that merely mention it). Scroll
+    // in steps, harvesting cards, until the harvested set stops growing.
+    let added = 0;
+    let totalSeenForQuery = 0;
+    await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+    let prevSize = -1;
+    let stableScroll = 0;
+    for (let i = 0; i < 12; i++) {
+      const got: string[] = await page.$$eval(sel, (els) => els.map((el) => ((el as HTMLElement).innerText || '').trim())).catch(() => []);
+      for (const text of got) {
+        const it = parseFromInnerText(text);
+        if (!it || !it.name) continue;
+        totalSeenForQuery += 1;
+        const key = it.name.toLowerCase();
+        if (!seen.has(key)) { seen.set(key, { ...it, matchedQuery: query }); added += 1; }
+      }
+      if (seen.size === prevSize) { stableScroll += 1; if (stableScroll >= 2) break; }
+      else { stableScroll = 0; prevSize = seen.size; }
+      await page.evaluate(() => window.scrollBy(0, 700)).catch(() => {});
+      await page.waitForTimeout(180);
+    }
+    await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+    logger.info({ query, cardsSeen: totalSeenForQuery, newItems: added, sel }, 'searchMenuItems: query scraped (scrolled)');
+  }
+
+  // Clear the search box so it doesn't leave the menu filtered for later steps.
+  await input.fill('').catch(() => {});
+  await page.waitForTimeout(300);
+
+  const items = Array.from(seen.values());
+  logger.info({ queries: queries.length, uniqueItems: items.length }, 'searchMenuItems: done');
+  return items;
+}
+
 // Parse a slot label like "7:45am" / "9:00 AM" into minutes-from-midnight,
 // so we can find the slot closest to a target time. Returns null if the
 // label doesn't look like a clock time.
-function slotLabelToMinutes(label) {
+function slotLabelToMinutes(label: string | null | undefined): number | null {
   const m = String(label || '').match(/\b(\d{1,2}):(\d{2})\s*([AaPp])\.?\s*[Mm]\.?/);
-  if (!m) return null;
+  if (!m || m[1] == null || m[2] == null || m[3] == null) return null;
   let h = parseInt(m[1], 10);
   const min = parseInt(m[2], 10);
   if (h < 1 || h > 12 || min > 59) return null;
@@ -329,21 +499,21 @@ function slotLabelToMinutes(label) {
 // is closest to that target. Otherwise picks the first valid slot — the
 // closed-restaurant fallback behavior.
 // Returns { ok, reason, picked } where `picked` is the slot label we chose.
-async function tryPreorder(page, { saveScreenshot, targetTime } = {}) {
+async function tryPreorder(page: Page, { saveScreenshot, targetTime }: PreorderOptions = {}): Promise<PreorderResult> {
   // Grubhub auto-opens the Schedule modal on closed-restaurant pages, so
   // before clicking the opener button, check if it's already on screen.
   // Saves a redundant click that can race the modal mount.
-  const modalAlreadyOpen = await page
+  const modalAlreadyOpen: boolean = await page
     .evaluate(() => {
-      const visible = (el) => {
+      const visible = (el: Element | null): boolean => {
         if (!el) return false;
         const r = el.getBoundingClientRect();
         const s = window.getComputedStyle(el);
         return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
       };
-      for (const dlg of document.querySelectorAll('[role="dialog"], [aria-modal="true"]')) {
+      for (const dlg of Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]'))) {
         if (!visible(dlg)) continue;
-        const t = (dlg.innerText || '').trim();
+        const t = ((dlg as HTMLElement).innerText || '').trim();
         if (/schedule (my )?order|select a delivery time|select a pickup time/i.test(t)) return true;
       }
       return false;
@@ -375,7 +545,7 @@ async function tryPreorder(page, { saveScreenshot, targetTime } = {}) {
   // Step 1 — open the hour dropdown. Try a <select>, then a custom
   // role=combobox, then any clickable element labeled with hour/time.
   let hourOpened = false;
-  const hourOpeners = [
+  const hourOpeners: string[] = [
     '[role="dialog"] select',
     '[role="dialog"] [role="combobox"]',
     '[role="dialog"] [aria-haspopup="listbox"]',
@@ -399,22 +569,22 @@ async function tryPreorder(page, { saveScreenshot, targetTime } = {}) {
   // Without a target, fall back to "first valid slot" (closed-restaurant
   // path). The dropdown may render options inside the modal or in a sibling
   // portal, so we search the whole document, not just the dialog.
-  let picked = null;
+  let picked: string | null = null;
   const timeRe = /\b\d{1,2}:\d{2}\s*[ap]\.?m\.?/i;
-  const optionSelectors = [
+  const optionSelectors: string[] = [
     '[role="listbox"] [role="option"]:not([aria-disabled="true"])',
     '[role="dialog"] [role="option"]:not([aria-disabled="true"])',
     'select option',
     '[role="dialog"] li:not([aria-disabled="true"])',
   ];
 
-  async function clickOption(el, text, sel) {
+  async function clickOption(el: ElementHandle<Element>, text: string, sel: string): Promise<void> {
     const isOptionTag = await el.evaluate((n) => n.tagName.toLowerCase() === 'option').catch(() => false);
     if (isOptionTag) {
       await el.evaluate((n) => {
-        const parent = n.closest('select');
+        const parent = n.closest('select') as HTMLSelectElement | null;
         if (parent) {
-          parent.value = n.value;
+          parent.value = (n as HTMLOptionElement).value;
           parent.dispatchEvent(new Event('change', { bubbles: true }));
         }
       }).catch(() => {});
@@ -428,11 +598,11 @@ async function tryPreorder(page, { saveScreenshot, targetTime } = {}) {
   if (targetTime && Number.isFinite(targetTime.minutesFromMidnight)) {
     // Collect all time-shaped candidates across selectors, then pick the
     // one with smallest absolute distance to the target.
-    const candidates = [];
+    const candidates: { el: ElementHandle<Element>; text: string; sel: string; mins: number }[] = [];
     for (const sel of optionSelectors) {
       const els = await page.$$(sel).catch(() => []);
       for (const el of els) {
-        const text = (await el.evaluate((n) => (n.innerText || n.textContent || '').trim()).catch(() => '')) || '';
+        const text = (await el.evaluate((n) => ((n as HTMLElement).innerText || n.textContent || '').trim()).catch(() => '')) || '';
         if (!timeRe.test(text)) continue;
         const mins = slotLabelToMinutes(text);
         if (mins == null) continue;
@@ -440,9 +610,9 @@ async function tryPreorder(page, { saveScreenshot, targetTime } = {}) {
       }
       if (candidates.length) break; // first selector that yields options wins
     }
-    if (candidates.length) {
-      candidates.sort((a, b) => Math.abs(a.mins - targetTime.minutesFromMidnight) - Math.abs(b.mins - targetTime.minutesFromMidnight));
-      const best = candidates[0];
+    candidates.sort((a, b) => Math.abs(a.mins - targetTime.minutesFromMidnight) - Math.abs(b.mins - targetTime.minutesFromMidnight));
+    const best = candidates[0];
+    if (best) {
       logger.info(
         { target: targetTime.raw, chosen: best.text, deltaMins: best.mins - targetTime.minutesFromMidnight, choices: candidates.length },
         'matching preorder slot to target time',
@@ -453,7 +623,7 @@ async function tryPreorder(page, { saveScreenshot, targetTime } = {}) {
     for (const sel of optionSelectors) {
       const els = await page.$$(sel).catch(() => []);
       for (const el of els) {
-        const text = (await el.evaluate((n) => (n.innerText || n.textContent || '').trim()).catch(() => '')) || '';
+        const text = (await el.evaluate((n) => ((n as HTMLElement).innerText || n.textContent || '').trim()).catch(() => '')) || '';
         if (!timeRe.test(text)) continue;
         await clickOption(el, text, sel);
         break;
@@ -467,10 +637,10 @@ async function tryPreorder(page, { saveScreenshot, targetTime } = {}) {
   // bottom CTA ("Delivery" / "Pickup"). If we didn't click an option above
   // but the modal already shows a time-shaped string, treat it as picked.
   if (!picked) {
-    const defaultTime = await page
+    const defaultTime: string | null = await page
       .evaluate((reSrc) => {
         const re = new RegExp(reSrc, 'i');
-        const dlg = document.querySelector('[role="dialog"], [aria-modal="true"]');
+        const dlg = document.querySelector('[role="dialog"], [aria-modal="true"]') as HTMLElement | null;
         if (!dlg) return null;
         const t = (dlg.innerText || '').trim();
         const m = t.match(re);
@@ -487,17 +657,17 @@ async function tryPreorder(page, { saveScreenshot, targetTime } = {}) {
     // Diagnostic: dump the modal contents so we can add the right selector.
     const diag = await page
       .evaluate(() => {
-        const visible = (el) => {
+        const visible = (el: Element): boolean => {
           const r = el.getBoundingClientRect();
           const s = window.getComputedStyle(el);
           return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
         };
         const dialog = document.querySelector('[role="dialog"], [data-testid*="modal" i], [data-testid*="schedule" i]');
         const root = dialog || document.body;
-        const out = [];
-        for (const el of root.querySelectorAll('button, [role="option"], [role="button"], li')) {
+        const out: { text: string; testid: string | null; ariaLabel: string | null; disabled: boolean }[] = [];
+        for (const el of Array.from(root.querySelectorAll('button, [role="option"], [role="button"], li'))) {
           if (!visible(el)) continue;
-          const t = (el.innerText || '').trim();
+          const t = ((el as HTMLElement).innerText || '').trim();
           if (!t) continue;
           out.push({
             text: t.slice(0, 80),
@@ -518,7 +688,7 @@ async function tryPreorder(page, { saveScreenshot, targetTime } = {}) {
   // After picking a slot, some flows close automatically; others need a
   // "Schedule" / "Save" / "Confirm" / "Apply" button click.
   await page.waitForTimeout(800);
-  const confirmSelectors = [
+  const confirmSelectors: string[] = [
     // Modern Grubhub modal: CTA is "Delivery" / "Pickup" — the order-type
     // word, not "Submit". Listed first because it's now the common case.
     '[role="dialog"] button:has-text("Delivery")',
@@ -556,20 +726,20 @@ async function tryPreorder(page, { saveScreenshot, targetTime } = {}) {
 // pickup". Grubhub then re-renders the menu in pickup mode. Returns true if the
 // switch button was found and clicked. Only call this for pickup orders — for a
 // delivery order a pickup-only location can't fulfill the request.
-async function switchToPickup(page) {
-  const clicked = await page.evaluate(() => {
-    const visible = (el) => {
+async function switchToPickup(page: Page): Promise<boolean> {
+  const clicked: boolean = await page.evaluate(() => {
+    const visible = (el: Element | null): boolean => {
       if (!el) return false;
       const r = el.getBoundingClientRect();
       const s = window.getComputedStyle(el);
       return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
     };
-    for (const dlg of document.querySelectorAll('[role="dialog"], [aria-modal="true"]')) {
+    for (const dlg of Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]'))) {
       if (!visible(dlg)) continue;
-      for (const btn of dlg.querySelectorAll('button, a, [role="button"]')) {
+      for (const btn of Array.from(dlg.querySelectorAll('button, a, [role="button"]'))) {
         if (!visible(btn)) continue;
-        if (/switch to pickup/i.test((btn.innerText || '').trim())) {
-          btn.click();
+        if (/switch to pickup/i.test(((btn as HTMLElement).innerText || '').trim())) {
+          (btn as HTMLElement).click();
           return true;
         }
       }
@@ -593,4 +763,4 @@ async function switchToPickup(page) {
   return true;
 }
 
-module.exports = { scrapeMenu, tryPreorder, switchToPickup, SELECTORS };
+export { scrapeMenu, searchMenuItems, tryPreorder, switchToPickup, SELECTORS };
