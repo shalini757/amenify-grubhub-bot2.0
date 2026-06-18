@@ -1,69 +1,16 @@
-import Anthropic from '@anthropic-ai/sdk';
-import fs from 'fs';
-import { logger } from '../logger';
+const Anthropic = require('@anthropic-ai/sdk');
+const fs = require('fs');
+const { logger } = require('../logger');
 
 const MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
 const HEALTH_MODEL = process.env.CLAUDE_HEALTH_MODEL || 'claude-haiku-4-5-20251001';
 
 // ---- Shared shapes ---------------------------------------------------------
 
-export type CandidateKind = 'exact' | 'fuzzy';
-
-export interface Candidate {
-  matched_name: string;
-  matched_price: number | null;
-  confidence: number;
-  kind: CandidateKind;
-  notes: string;
-}
-
-export interface RankedEntry {
-  requested: string;
-  candidates: Candidate[];
-}
-
-export interface RankedResult {
-  ranked: RankedEntry[];
-}
-
-export interface BudgetPick {
-  requested: string;
-  qty: number;
-  matched_name: string;
-  matched_price: number | null;
-  confidence: number;
-  kind: CandidateKind;
-  notes: string;
-}
-
-export interface BudgetAttempt {
-  label: string;
-  total: number;
-  picks: string[];
-}
-
-export interface BudgetMatchResult {
-  withinBudget: boolean;
-  picks: BudgetPick[];
-  totalUsed: number;
-  reason: string | null;
-  attempts: BudgetAttempt[];
-  exactCount?: number;
-  rankedRaw?: RankedEntry[];
-}
-
-export interface RequestedItem {
-  name?: string;
-  qty?: number;
-  [key: string]: unknown;
-}
-
 // ---- Errors ----------------------------------------------------------------
 
-export class ClaudeInvalidJsonError extends Error {
-  code: string;
-  raw: unknown;
-  constructor(message: string, raw: unknown) {
+class ClaudeInvalidJsonError extends Error {
+  constructor(message, raw) {
     super(message);
     this.code = 'CLAUDE_INVALID_JSON';
     this.raw = raw;
@@ -72,8 +19,8 @@ export class ClaudeInvalidJsonError extends Error {
 
 // ---- Client ----------------------------------------------------------------
 
-let _client: Anthropic | undefined;
-function client(): Anthropic {
+let _client;
+function client() {
   if (!_client) {
     const key = process.env.ANTHROPIC_API_KEY;
     if (!key) {
@@ -84,8 +31,8 @@ function client(): Anthropic {
   return _client;
 }
 
-function logUsage(label: string, response: Anthropic.Message): void {
-  const usage = response && response.usage ? response.usage : ({} as Anthropic.Usage);
+function logUsage(label, response) {
+  const usage = response && response.usage ? response.usage : {};
   logger.info(
     {
       label,
@@ -99,16 +46,16 @@ function logUsage(label: string, response: Anthropic.Message): void {
   );
 }
 
-function extractText(response: Anthropic.Message): string {
+function extractText(response) {
   if (!response || !Array.isArray(response.content)) return '';
   return response.content
-    .filter((b): b is Anthropic.TextBlock => b.type === 'text')
+    .filter((b) => b.type === 'text')
     .map((b) => b.text)
     .join('\n')
     .trim();
 }
 
-function parseJsonStrict(text: string, label: string): any {
+function parseJsonStrict(text, label) {
   if (!text) throw new ClaudeInvalidJsonError(`${label}: empty response`, text);
   let candidate = text.trim();
   if (candidate.startsWith('```')) {
@@ -130,7 +77,7 @@ function parseJsonStrict(text: string, label: string): any {
   }
 }
 
-function stripHtml(html: string | null | undefined): string {
+function stripHtml(html) {
   if (!html) return '';
   return String(html)
     .replace(/<script[\s\S]*?<\/script>/gi, '')
@@ -143,13 +90,7 @@ function stripHtml(html: string | null | undefined): string {
 
 // ---- High-level calls ------------------------------------------------------
 
-export interface HelloWorldResult {
-  ok: boolean;
-  text: string;
-  model: string;
-}
-
-async function helloWorld(): Promise<HelloWorldResult> {
+async function helloWorld() {
   console.log('[claude] helloWorld');
   const res = await client().messages.create({
     model: HEALTH_MODEL,
@@ -161,23 +102,10 @@ async function helloWorld(): Promise<HelloWorldResult> {
   return { ok: /OK/i.test(text), text, model: res.model };
 }
 
-export interface MatchItemsResult {
-  matches: Array<{
-    requested: string;
-    matched_id: string | null;
-    matched_name: string | null;
-    confidence: number;
-    notes: string;
-  }>;
-}
-
 async function matchItems({
   requestedItems,
   menu,
-}: {
-  requestedItems: RequestedItem[];
-  menu: unknown;
-}): Promise<MatchItemsResult> {
+}) {
   console.log('[claude] matchItems', requestedItems);
   if (!Array.isArray(requestedItems) || !requestedItems.length) {
     throw new Error('matchItems: requestedItems must be a non-empty array');
@@ -234,11 +162,7 @@ async function rankCandidates({
   requestedItems,
   menu,
   maxCandidatesPerItem = 4,
-}: {
-  requestedItems: RequestedItem[];
-  menu: unknown;
-  maxCandidatesPerItem?: number;
-}): Promise<RankedResult> {
+}) {
   console.log('[claude] rankCandidates', requestedItems.length, 'items');
   if (!Array.isArray(requestedItems) || !requestedItems.length) {
     throw new Error('rankCandidates: requestedItems must be a non-empty array');
@@ -266,20 +190,33 @@ async function rankCandidates({
     `Requested items:\n${JSON.stringify(requestedItems, null, 2)}\n\n` +
     `Menu:\n${JSON.stringify(menu, null, 2)}`;
 
-  const res = await client().messages.create({
-    model: MODEL,
-    max_tokens: 4096,
-    system,
-    messages: [{ role: 'user', content: user }],
-  });
-  logUsage('rankCandidates', res);
-  const text = extractText(res);
-  const parsed = parseJsonStrict(text, 'rankCandidates');
-  if (!parsed || !Array.isArray(parsed.ranked)) {
-    throw new ClaudeInvalidJsonError('rankCandidates: missing ranked[]', text);
+  // Retry on malformed/truncated JSON. A big full-menu candidate set (e.g. 97
+  // items) can blow past a small max_tokens and truncate mid-JSON, and Haiku
+  // occasionally emits invalid JSON — neither should hard-FAIL the order. Bump
+  // the token ceiling and retry a few times before giving up.
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const res = await client().messages.create({
+      model: MODEL,
+      max_tokens: 8192,
+      system,
+      messages: [{ role: 'user', content: user }],
+    });
+    logUsage('rankCandidates', res);
+    const text = extractText(res);
+    try {
+      const parsed = parseJsonStrict(text, 'rankCandidates');
+      if (!parsed || !Array.isArray(parsed.ranked)) {
+        throw new ClaudeInvalidJsonError('rankCandidates: missing ranked[]', text);
+      }
+      console.log('[claude] rankCandidates → candidates per item:', parsed.ranked.map((r) => `${r.requested}=${r.candidates?.length || 0}`).join(', '));
+      return parsed;
+    } catch (e) {
+      lastErr = e;
+      console.log(`[claude] rankCandidates attempt ${attempt}/3 invalid JSON (${(e.message || '').slice(0, 80)}) — ${attempt < 3 ? 'retrying' : 'giving up'}`);
+    }
   }
-  console.log('[claude] rankCandidates → candidates per item:', parsed.ranked.map((r: RankedEntry) => `${r.requested}=${r.candidates?.length || 0}`).join(', '));
-  return parsed;
+  throw lastErr;
 }
 
 // Pure function. Picks the combination of candidates (one per requested item)
@@ -301,30 +238,13 @@ async function rankCandidates({
 //   quantities: array of qty for each requested item (same order as ranked)
 //   maxTotal:  budget cap
 //   confidenceThreshold: minimum confidence to consider a candidate
-interface FilteredItem {
-  requested: string;
-  qty: number;
-  candidates: Candidate[];
-}
-
-interface ComboScore {
-  score: number;
-  exactCount: number;
-  confSum: number;
-  costSum: number;
-}
 
 function solveBudget({
   ranked,
   quantities,
   maxTotal,
   confidenceThreshold = 0.85,
-}: {
-  ranked: RankedEntry[];
-  quantities: number[];
-  maxTotal: number;
-  confidenceThreshold?: number;
-}): BudgetMatchResult {
+}) {
   if (!Array.isArray(ranked) || !ranked.length) {
     return { withinBudget: false, picks: [], totalUsed: 0, reason: 'No items to match', attempts: [] };
   }
@@ -334,7 +254,7 @@ function solveBudget({
 
   // Filter each item's candidates by confidence threshold. If an item has no
   // candidates above threshold, we already know we can't ship it — fail fast.
-  const filtered: FilteredItem[] = ranked.map((r, idx) => {
+  const filtered = ranked.map((r, idx) => {
     const qtyRaw = quantities[idx];
     const qty = Number.isFinite(qtyRaw) && qtyRaw > 0 ? qtyRaw : 1;
     const valid = (r.candidates || [])
@@ -361,7 +281,7 @@ function solveBudget({
   // The exact-count term dominates (prefer all-exacts over all-fuzzy), then
   // confidence (prefer 0.95 fuzzy over 0.85 fuzzy), then budget-utilization
   // (prefer $24 of $25 over $10 of $25, but only as a tiebreaker).
-  function scoreCombo(picks: Candidate[]): ComboScore {
+  function scoreCombo(picks) {
     let exactCount = 0;
     let confSum = 0;
     let costSum = 0;
@@ -386,8 +306,8 @@ function solveBudget({
     combinationCount = filtered.reduce((acc, f) => acc * f.candidates.length, 1);
   }
 
-  let best: ({ picks: Candidate[] } & ComboScore) | null = null;
-  let closestOver: ({ picks: Candidate[] } & ComboScore) | null = null; // closest over-budget combo, for diagnostics
+  let best = null;
+  let closestOver = null; // closest over-budget combo, for diagnostics
 
   // Iterative N-dimensional enumeration (no recursion → no stack risk).
   const idx = new Array(filtered.length).fill(0);
@@ -433,7 +353,7 @@ function solveBudget({
   // reviewer can see what we tried.
   const cheapestAttempt = filtered.map((f) => f.candidates[f.candidates.length - 1]);
   const cheapestCost = cheapestAttempt.reduce((acc, p, i) => acc + (p.matched_price || 0) * filtered[i].qty, 0);
-  const attempts: BudgetAttempt[] = ([
+  const attempts = ([
     closestOver && {
       label: 'closest-over-budget',
       total: +closestOver.costSum.toFixed(2),
@@ -444,7 +364,7 @@ function solveBudget({
       total: +cheapestCost.toFixed(2),
       picks: cheapestAttempt.map((p, i) => `"${filtered[i].requested}" -> ${p.matched_name} @ $${p.matched_price} (${p.kind})`),
     },
-  ].filter(Boolean) as BudgetAttempt[]);
+  ].filter(Boolean));
 
   return {
     withinBudget: false,
@@ -461,14 +381,9 @@ async function matchItemsBudgetAware({
   menu,
   maxTotal,
   confidenceThreshold = 0.85,
-}: {
-  requestedItems: RequestedItem[];
-  menu: unknown;
-  maxTotal: number;
-  confidenceThreshold?: number;
-}): Promise<BudgetMatchResult> {
+}) {
   const ranked = await rankCandidates({ requestedItems, menu });
-  const quantities = requestedItems.map((it) => it.qty as number);
+  const quantities = requestedItems.map((it) => it.qty);
   const solved = solveBudget({
     ranked: ranked.ranked,
     quantities,
@@ -484,23 +399,11 @@ async function matchItemsBudgetAware({
 // each pick back to a DOM option by text match (with cheapest as fallback
 // when the named option can't be located, so a hallucinated label can't
 // block the cart).
-export interface ModifierPick {
-  sectionKey: string;
-  optionText: string;
-  reason: string;
-}
-
-export interface PickModifiersResult {
-  picks: ModifierPick[];
-}
 
 async function pickModifiers({
   itemName,
   sections,
-}: {
-  itemName: string;
-  sections: unknown[];
-}): Promise<PickModifiersResult> {
+}) {
   console.log('[claude] pickModifiers', itemName, sections.length, 'sections');
   if (!Array.isArray(sections) || !sections.length) {
     return { picks: [] };
@@ -534,15 +437,7 @@ async function pickModifiers({
   return parsed;
 }
 
-export interface ParseConfirmationResult {
-  success: boolean;
-  order_id: string | null;
-  total: number | null;
-  eta: string | null;
-  notes: string;
-}
-
-async function parseConfirmation({ html }: { html: string | null | undefined }): Promise<ParseConfirmationResult> {
+async function parseConfirmation({ html }) {
   console.log('[claude] parseConfirmation');
   const cleaned = stripHtml(html);
   const system =
@@ -567,25 +462,14 @@ async function parseConfirmation({ html }: { html: string | null | undefined }):
   return parsed;
 }
 
-export interface ReasonAboutErrorResult {
-  what_happened: string;
-  recommended_action: string;
-  blocker_type: string;
-  retryable: boolean;
-}
-
 async function reasonAboutError({
   screenshotPath,
   screenshotBase64,
   dom,
-}: {
-  screenshotPath?: string;
-  screenshotBase64?: string;
-  dom: string | null | undefined;
-}): Promise<ReasonAboutErrorResult> {
+}) {
   console.log('[claude] reasonAboutError');
   const cleaned = stripHtml(dom);
-  const userBlocks: Anthropic.ContentBlockParam[] = [];
+  const userBlocks = [];
   if (screenshotBase64) {
     userBlocks.push({
       type: 'image',
@@ -627,7 +511,7 @@ async function reasonAboutError({
   return parsed;
 }
 
-export {
+module.exports = {
   helloWorld,
   matchItems,
   rankCandidates,

@@ -6,13 +6,13 @@
 // still alive; a live PID means another bot is running → refuse to start. A
 // stale PID (process gone, e.g. after a hard crash) is reclaimed.
 
-import fs from 'fs';
-import path from 'path';
-import { logger } from '../logger';
+const fs = require('fs');
+const path = require('path');
+const { logger } = require('../logger');
 
 const LOCK_FILE = path.resolve(process.cwd(), '.bot-instance.lock');
 
-function isAlive(pid: number): boolean {
+function isAlive(pid) {
   if (!pid || Number.isNaN(pid)) return false;
   try {
     // Signal 0 doesn't kill — it just probes existence/permission.
@@ -20,12 +20,12 @@ function isAlive(pid: number): boolean {
     return true;
   } catch (err) {
     // ESRCH = no such process (stale). EPERM = exists but not ours (alive).
-    return (err as NodeJS.ErrnoException).code === 'EPERM';
+    return err.code === 'EPERM';
   }
 }
 
 // Acquire the lock or throw. Call once at startup of any order-processing command.
-function acquire(label: string): () => void {
+function acquire(label) {
   if (fs.existsSync(LOCK_FILE)) {
     const raw = (fs.readFileSync(LOCK_FILE, 'utf8') || '').trim();
     const pid = parseInt(raw.split('|')[0], 10);
@@ -41,7 +41,7 @@ function acquire(label: string): () => void {
   fs.writeFileSync(LOCK_FILE, `${process.pid}|${label}|${new Date().toISOString()}`);
   logger.info({ pid: process.pid, label, lockFile: LOCK_FILE }, 'instance lock acquired');
 
-  const release = (): void => {
+  const release = () => {
     try {
       const raw = fs.existsSync(LOCK_FILE) ? fs.readFileSync(LOCK_FILE, 'utf8') : '';
       const pid = parseInt((raw || '').split('|')[0], 10);
@@ -56,4 +56,4 @@ function acquire(label: string): () => void {
   return release;
 }
 
-export { acquire };
+module.exports = { acquire };

@@ -1,3 +1,5 @@
+'use strict';
+
 // Launches a real Chrome with the remote-debugging-port flag so Playwright
 // can attach to it later via chromium.connectOverCDP(). Uses a dedicated
 // user-data-dir under ./chrome-profile so it does not collide with your
@@ -17,29 +19,29 @@
 //
 // The bot attaches to the running Chrome via CDP and drives it.
 
-import { spawn, ChildProcess } from 'child_process';
-import fs from 'fs';
-import path from 'path';
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
-const PORT: string = process.env.CDP_PORT || '9222';
-const PROFILE_DIR: string = path.resolve(process.cwd(), 'chrome-profile');
+const PORT = process.env.CDP_PORT || '9222';
+const PROFILE_DIR = path.resolve(process.cwd(), 'chrome-profile');
 
-const CANDIDATE_CHROME_PATHS: string[] = [
+const CANDIDATE_CHROME_PATHS = [
   process.env.CHROME_PATH,
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
   process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Google\\Chrome\\Application\\chrome.exe'),
-].filter((p): p is string => Boolean(p));
+].filter(Boolean);
 
-function findChrome(): string | null {
+function findChrome() {
   for (const p of CANDIDATE_CHROME_PATHS) {
     if (fs.existsSync(p)) return p;
   }
   return null;
 }
 
-function main(): void {
-  const chrome: string | null = findChrome();
+function main() {
+  const chrome = findChrome();
   if (!chrome) {
     console.error('Could not find chrome.exe in any of these locations:');
     CANDIDATE_CHROME_PATHS.forEach((p) => console.error(`  - ${p}`));
@@ -51,23 +53,13 @@ function main(): void {
     fs.mkdirSync(PROFILE_DIR, { recursive: true });
   }
 
-  // Set HEADLESS_CHROME=true to run real Chrome with no visible window.
-  // This keeps the trusted real-Chrome fingerprint the address swap relies
-  // on (unlike Playwright's headless Chromium, which trips bot detection and
-  // suppresses the Google Places autocomplete). Log in / pass captcha ONCE
-  // headful so the ./chrome-profile cookies persist, then run headless.
-  const headless: boolean = String(process.env.HEADLESS_CHROME || '').toLowerCase() === 'true';
-
-  const args: string[] = [
+  const args = [
     `--remote-debugging-port=${PORT}`,
     `--user-data-dir=${PROFILE_DIR}`,
     '--no-first-run',
     '--no-default-browser-check',
-    headless ? '--headless=new' : '--start-maximized',
-    ...(headless ? ['--window-size=1366,850', '--disable-gpu'] : []),
+    '--start-maximized',
   ];
-
-  console.log(`Mode: ${headless ? 'HEADLESS (--headless=new)' : 'headful'}`);
 
   console.log(`Launching: ${chrome}`);
   console.log(`Profile: ${PROFILE_DIR}`);
@@ -80,7 +72,7 @@ function main(): void {
   console.log('  4. In another terminal:  node tests/dryRunFlow.js');
   console.log('');
 
-  const child: ChildProcess = spawn(chrome, args, {
+  const child = spawn(chrome, args, {
     detached: true,
     stdio: 'ignore',
   });

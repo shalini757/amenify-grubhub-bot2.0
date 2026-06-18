@@ -1,7 +1,6 @@
-import http from 'http';
-import type { IncomingMessage, ServerResponse, Server } from 'http';
-import { logger } from './logger';
-import { handleInteractivePayload, verifySlackSignature } from './review/slackApproval';
+const http = require('http');
+const { logger } = require('./logger');
+const { handleInteractivePayload, verifySlackSignature } = require('./review/slackApproval');
 
 // Webhook trigger server (self-diagnosing).
 //
@@ -27,35 +26,31 @@ import { handleInteractivePayload, verifySlackSignature } from './review/slackAp
 // your sheet fires but health's `lastTriggerAt` never updates, the POST is not
 // reaching this process (wrong tunnel URL, serve not running, or wrong secret).
 
-interface StartServerOptions {
-  processOneOrder: () => Promise<number>;
-}
-
-function startServer({ processOneOrder }: StartServerOptions): Server {
+function startServer({ processOneOrder }) {
   console.log('Starting trigger server...------------------------>>>>>>>>>>>>>>>>>>>>>>>>>');
   const port = parseInt(process.env.TRIGGER_PORT || '8787', 10);
   const secret = process.env.TRIGGER_SECRET || '';
   const pollMs = Math.max(5000, parseInt(process.env.POLL_INTERVAL_MS || '300000', 10));
 
   // --- diagnostics state ---
-  const startedAt: number = Date.now();
-  let triggerCount: number = 0;       // accepted triggers
-  let rejectedCount: number = 0;      // rejected (bad/missing secret)
-  let lastTriggerAt: number | null = null;   // last accepted /trigger
-  let lastTriggerSource: string | null = null;
-  let lastRejectAt: number | null = null;
-  let lastRejectReason: string | null = null;
-  let lastDrainStartedAt: number | null = null;
-  let lastDrainFinishedAt: number | null = null;
-  let lastDrainSummary: string | null = null;
-  let lastErrorAt: number | null = null;
-  let lastError: string | null = null;
-  let ordersProcessed: number = 0;
+  const startedAt = Date.now();
+  let triggerCount = 0;       // accepted triggers
+  let rejectedCount = 0;      // rejected (bad/missing secret)
+  let lastTriggerAt = null;   // last accepted /trigger
+  let lastTriggerSource = null;
+  let lastRejectAt = null;
+  let lastRejectReason = null;
+  let lastDrainStartedAt = null;
+  let lastDrainFinishedAt = null;
+  let lastDrainSummary = null;
+  let lastErrorAt = null;
+  let lastError = null;
+  let ordersProcessed = 0;
 
-  let running: boolean = false;
-  let pending: boolean = false;
+  let running = false;
+  let pending = false;
 
-  function banner(): void {
+  function banner() {
     const line = '-'.repeat(62);
     const secretLine = secret
       ? 'set OK (POSTs must send a matching X-Trigger-Secret)'
@@ -81,7 +76,7 @@ function startServer({ processOneOrder }: StartServerOptions): Server {
 
   // Process every ready row until the queue is empty, then stop. Re-entrant
   // calls are coalesced via the `pending` flag (single-flight).
-  async function drain(source: string): Promise<void> {
+  async function drain(source) {
     if (running) {
       pending = true;
       logger.info({ source }, 'drain already running -- coalesced (pending=true)');
@@ -94,7 +89,7 @@ function startServer({ processOneOrder }: StartServerOptions): Server {
     try {
       // eslint-disable-next-line no-constant-condition
       while (true) {
-        const code = await processOneOrder().catch((err: unknown) => {
+        const code = await processOneOrder().catch((err) => {
           const e = err instanceof Error ? err : new Error(String(err));
           lastErrorAt = Date.now();
           lastError = e.message;
@@ -123,7 +118,7 @@ function startServer({ processOneOrder }: StartServerOptions): Server {
     }
   }
 
-  function readBody(req: IncomingMessage): Promise<string> {
+  function readBody(req) {
     return new Promise((resolve) => {
       let data = '';
       req.on('data', (c) => {
@@ -135,8 +130,8 @@ function startServer({ processOneOrder }: StartServerOptions): Server {
     });
   }
 
-  function healthPayload(): Record<string, unknown> {
-    const agoSec = (t: number | null): number | null => (t ? Math.round((Date.now() - t) / 1000) : null);
+  function healthPayload() {
+    const agoSec = (t) => (t ? Math.round((Date.now() - t) / 1000) : null);
     return {
       ok: true,
       service: 'grubhub-bot-2.0 trigger server',
@@ -166,7 +161,7 @@ function startServer({ processOneOrder }: StartServerOptions): Server {
     };
   }
 
-  const server = http.createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  const server = http.createServer(async (req, res) => {
     const ip = req.socket.remoteAddress;
     const url = req.url || '';
 
@@ -229,7 +224,7 @@ function startServer({ processOneOrder }: StartServerOptions): Server {
       }
 
       // Body is application/x-www-form-urlencoded: payload=<urlencoded JSON>.
-      let payload: Parameters<typeof handleInteractivePayload>[0] | null = null;
+      let payload = null;
       try {
         const params = new URLSearchParams(raw);
         payload = JSON.parse(params.get('payload') || '{}');
@@ -243,7 +238,7 @@ function startServer({ processOneOrder }: StartServerOptions): Server {
       res.end(JSON.stringify({ ok: true }));
 
       if (payload) {
-        handleInteractivePayload(payload).catch((err: unknown) => {
+        handleInteractivePayload(payload).catch((err) => {
           const msg = err instanceof Error ? err.message : String(err);
           logger.warn({ err: msg }, 'handleInteractivePayload threw');
         });
@@ -276,4 +271,4 @@ function startServer({ processOneOrder }: StartServerOptions): Server {
   return server;
 }
 
-export { startServer };
+module.exports = { startServer };

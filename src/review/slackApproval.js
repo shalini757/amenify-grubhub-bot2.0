@@ -1,35 +1,21 @@
-import fs from 'fs';
-import path from 'path';
-import crypto from 'crypto';
-import { logger } from '../logger';
-import * as approvalStore from './approvalStore';
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const { logger } = require('../logger');
+const approvalStore = require('./approvalStore');
 
 const SLACK_API = 'https://slack.com/api';
 
-function token(): string {
+function token() {
   const t = process.env.SLACK_BOT_TOKEN;
   if (!t) throw new Error('SLACK_BOT_TOKEN env var is required for approval flow');
   return t;
 }
 
-function channelId(): string {
+function channelId() {
   const c = process.env.SLACK_APPROVAL_CHANNEL;
   if (!c) throw new Error('SLACK_APPROVAL_CHANNEL env var is required (channel ID like C0123456789 or channel name)');
   return c;
-}
-
-interface UploadScreenshotOptions {
-  title?: string;
-  channelId?: string;
-  threadTs?: string;
-  initialComment?: string;
-}
-
-interface UploadScreenshotResult {
-  ok: boolean;
-  error?: string;
-  fileId?: string;
-  permalink?: string;
 }
 
 // Uploads a local screenshot to Slack using the modern files.uploadV2 flow:
@@ -37,7 +23,7 @@ interface UploadScreenshotResult {
 //   2. PUT the bytes to upload_url
 //   3. files.completeUploadExternal with the file_id (and optional channel)
 // Returns { ok, fileId, permalink } or { ok: false, error }.
-async function uploadScreenshot(localPath: string, { title, channelId: chId, threadTs, initialComment }: UploadScreenshotOptions = {}): Promise<UploadScreenshotResult> {
+async function uploadScreenshot(localPath, { title, channelId: chId, threadTs, initialComment } = {}) {
   if (!localPath || !fs.existsSync(localPath)) {
     return { ok: false, error: 'screenshot file not found' };
   }
@@ -47,7 +33,7 @@ async function uploadScreenshot(localPath: string, { title, channelId: chId, thr
   const urlRes = await fetch(`${SLACK_API}/files.getUploadURLExternal?filename=${encodeURIComponent(filename)}&length=${stats.size}`, {
     headers: { authorization: `Bearer ${token()}` },
   });
-  const urlJson = await urlRes.json().catch(() => ({})) as { ok?: boolean; error?: string; upload_url?: string; file_id?: string };
+  const urlJson = await urlRes.json().catch(() => ({}));
   if (!urlJson.ok) return { ok: false, error: `getUploadURLExternal: ${urlJson.error || 'unknown'}` };
   const { upload_url, file_id } = urlJson;
   if (!upload_url || !file_id) return { ok: false, error: 'getUploadURLExternal: missing upload_url/file_id' };
@@ -72,30 +58,10 @@ async function uploadScreenshot(localPath: string, { title, channelId: chId, thr
       ...(initialComment ? { initial_comment: initialComment } : {}),
     }),
   });
-  const completeJson = await completeRes.json().catch(() => ({})) as { ok?: boolean; error?: string; files?: Array<{ id?: string; permalink?: string }> };
+  const completeJson = await completeRes.json().catch(() => ({}));
   if (!completeJson.ok) return { ok: false, error: `completeUploadExternal: ${completeJson.error || 'unknown'}` };
   const file = (completeJson.files && completeJson.files[0]) || {};
   return { ok: true, fileId: file.id || file_id, permalink: file.permalink };
-}
-
-interface OrderItem {
-  name: string;
-  qty?: number;
-  price?: number | string | null;
-}
-
-interface BuildApprovalBlocksArgs {
-  orderId: string | number;
-  restaurantName?: string;
-  items?: OrderItem[];
-  subtotal?: number | string | null;
-  total?: number | string | null;
-  currency?: string;
-  maxTotal?: number | string | null;
-  deliveryAddress?: string | null;
-  account?: string | null;
-  rowNumber?: number | string | null;
-  dryRun?: boolean;
 }
 
 // Build a clean, scannable approval card. Sections, not a JSON dump:
@@ -108,8 +74,8 @@ interface BuildApprovalBlocksArgs {
 function buildApprovalBlocks({
   orderId, restaurantName, items = [], subtotal, total, currency = '$',
   maxTotal, deliveryAddress, account, rowNumber, dryRun = false,
-}: BuildApprovalBlocksArgs): unknown[] {
-  const money = (n: number | string | null | undefined): string => (n != null && n !== '' ? `${currency}${n}` : 'n/a');
+}) {
+  const money = (n) => (n != null && n !== '' ? `${currency}${n}` : 'n/a');
 
   const itemLines = (items || []).length
     ? items.map((i) => `• ${i.name}  ×${i.qty || 1}${i.price != null ? `  —  ${money(i.price)}` : ''}`).join('\n')
@@ -125,7 +91,7 @@ function buildApprovalBlocks({
     ? `🧪 DRY-RUN preview — Order ${orderId}`
     : `🛒 Approval needed — Order ${orderId}`;
 
-  const blocks: unknown[] = [
+  const blocks = [
     { type: 'header', text: { type: 'plain_text', text: headerText.slice(0, 150) } },
     {
       type: 'section',
@@ -192,18 +158,6 @@ function buildApprovalBlocks({
   return blocks;
 }
 
-interface SendCheckoutApprovalArgs extends BuildApprovalBlocksArgs {
-  screenshotPath?: string;
-}
-
-interface SendCheckoutApprovalResult {
-  ok: boolean;
-  error?: string;
-  channel?: string;
-  ts?: string;
-  screenshotPermalink?: string | null;
-}
-
 // Posts the approval message with Accept/Reject buttons and threads the
 // checkout screenshot beneath it. Returns { ok, channel, ts } so the caller
 // can block on waitForButtonApproval. When dryRun is true, the message is
@@ -212,7 +166,7 @@ interface SendCheckoutApprovalResult {
 async function sendCheckoutApproval({
   orderId, restaurantName, items, subtotal, total, currency = '$', maxTotal,
   deliveryAddress, account, screenshotPath, rowNumber, dryRun = false,
-}: SendCheckoutApprovalArgs): Promise<SendCheckoutApprovalResult> {
+}) {
   if (!orderId) throw new Error('sendCheckoutApproval: orderId is required');
 
   const blocks = buildApprovalBlocks({
@@ -232,7 +186,7 @@ async function sendCheckoutApproval({
       blocks,
     }),
   });
-  const json = await res.json().catch(() => ({})) as { ok?: boolean; error?: string; channel?: string; ts?: string };
+  const json = await res.json().catch(() => ({}));
   if (!json.ok) {
     logger.warn({ orderId, error: json.error, raw: json }, 'chat.postMessage failed');
     return { ok: false, error: json.error || 'unknown' };
@@ -253,7 +207,7 @@ async function sendCheckoutApproval({
   // Upload the checkout screenshot INTO this message's thread, using the
   // channel ID Slack just resolved. files.completeUploadExternal requires a
   // real channel ID, and threading keeps the image right under the buttons.
-  let screenshotPermalink: string | null = null;
+  let screenshotPermalink = null;
   if (screenshotPath) {
     const up = await uploadScreenshot(screenshotPath, {
       title: `Order ${orderId} — checkout review`,
@@ -279,33 +233,19 @@ async function sendCheckoutApproval({
   return { ok: true, channel, ts, screenshotPermalink };
 }
 
-interface WaitForButtonApprovalArgs {
-  channel?: string;
-  ts?: string;
-  timeoutMs?: number;
-  signal?: AbortSignal;
-}
-
 // Block until a reviewer clicks Accept/Reject on the message (resolved via the
 // approvalStore, which the /slack/interactive route populates), or the timeout
 // elapses. Same return shape as the old reaction-based waiter.
-async function waitForButtonApproval({ channel, ts, timeoutMs = 15 * 60 * 1000, signal }: WaitForButtonApprovalArgs = {}) {
+async function waitForButtonApproval({ channel, ts, timeoutMs = 15 * 60 * 1000, signal } = {}) {
   if (!channel || !ts) throw new Error('waitForButtonApproval requires { channel, ts }');
   logger.info({ channel, ts, timeoutMs }, 'waiting for Slack button approval');
   return approvalStore.waitFor(channel, ts, { timeoutMs, signal });
 }
 
-interface VerifySlackSignatureArgs {
-  signingSecret?: string;
-  timestamp?: string;
-  signature?: string;
-  rawBody?: string;
-}
-
 // Verify a Slack request signature (X-Slack-Signature / timestamp) using the
 // app's signing secret. Returns true if valid, or if no SLACK_SIGNING_SECRET
 // is configured (verification disabled — logged once by the caller).
-function verifySlackSignature({ signingSecret, timestamp, signature, rawBody }: VerifySlackSignatureArgs): boolean {
+function verifySlackSignature({ signingSecret, timestamp, signature, rawBody }) {
   if (!signingSecret) return true; // disabled
   if (!timestamp || !signature) return false;
   // Reject requests older than 5 min (replay protection).
@@ -320,26 +260,11 @@ function verifySlackSignature({ signingSecret, timestamp, signature, rawBody }: 
   }
 }
 
-interface SlackInteractivePayload {
-  actions?: Array<{ action_id?: string; value?: string }>;
-  channel?: { id?: string };
-  container?: { channel_id?: string; message_ts?: string };
-  message?: { ts?: string };
-  user?: { id?: string; username?: string; name?: string };
-}
-
-interface HandleInteractiveResult {
-  handled: boolean;
-  reason?: string;
-  decision?: string;
-  accepted?: boolean;
-}
-
 // Handle a parsed Slack interactive payload (the object inside `payload=`).
 // Resolves the approvalStore so the blocked order process gets the decision,
 // and updates the original message to show the outcome + disable the buttons.
 // Returns { handled, decision } for logging.
-async function handleInteractivePayload(payload: SlackInteractivePayload): Promise<HandleInteractiveResult> {
+async function handleInteractivePayload(payload) {
   const action = (payload.actions && payload.actions[0]) || {};
   const actionId = action.action_id;
   if (actionId !== 'approve_order' && actionId !== 'reject_order') {
@@ -352,11 +277,11 @@ async function handleInteractivePayload(payload: SlackInteractivePayload): Promi
   if (!channel || !ts) {
     return { handled: false, reason: 'missing channel/ts in payload' };
   }
-  let meta: Record<string, unknown> = {};
+  let meta = {};
   try { meta = JSON.parse(action.value || '{}'); } catch (_) { /* ignore */ }
-  const decisionWord: 'approve' | 'reject' = actionId === 'approve_order' ? 'approve' : 'reject';
+  const decisionWord = actionId === 'approve_order' ? 'approve' : 'reject';
 
-  const decision = { ok: true, decision: decisionWord, userId: user, userName, addedAt: Date.now() } as const;
+  const decision = { ok: true, decision: decisionWord, userId: user, userName, addedAt: Date.now() };
   const accepted = approvalStore.resolve(channel, ts, decision);
 
   // Update the original message: replace the buttons with a status line so it's
@@ -377,15 +302,8 @@ async function handleInteractivePayload(payload: SlackInteractivePayload): Promi
   return { handled: true, decision: decisionWord, accepted };
 }
 
-interface UpdateMessageArgs {
-  channel: string;
-  ts: string;
-  text: string;
-  blocks?: unknown[];
-}
-
 // chat.update — replace a message's text/blocks in place.
-async function updateMessage({ channel, ts, text, blocks }: UpdateMessageArgs): Promise<unknown> {
+async function updateMessage({ channel, ts, text, blocks }) {
   const res = await fetch(`${SLACK_API}/chat.update`, {
     method: 'POST',
     headers: { authorization: `Bearer ${token()}`, 'content-type': 'application/json; charset=utf-8' },
@@ -408,30 +326,7 @@ async function updateMessage({ channel, ts, text, blocks }: UpdateMessageArgs): 
 const APPROVE_EMOJI = (process.env.SLACK_APPROVE_EMOJI || 'white_check_mark').replace(/^:|:$/g, '');
 const REJECT_EMOJI = (process.env.SLACK_REJECT_EMOJI || 'x').replace(/^:|:$/g, '');
 
-interface WaitForReactionApprovalArgs {
-  channel?: string;
-  ts?: string;
-  timeoutMs?: number;
-  pollIntervalMs?: number;
-  signal?: AbortSignal;
-}
-
-interface ReactionDecision {
-  decision: 'approve' | 'reject';
-  userId: string;
-  emoji: string;
-}
-
-interface WaitForReactionApprovalResult {
-  ok: boolean;
-  decision?: 'approve' | 'reject' | 'timeout' | 'aborted';
-  userId?: string;
-  emoji?: string;
-  addedAt?: number;
-  polledFor?: number;
-}
-
-async function waitForReactionApproval({ channel, ts, timeoutMs = 15 * 60 * 1000, pollIntervalMs = 5000, signal }: WaitForReactionApprovalArgs = {}): Promise<WaitForReactionApprovalResult> {
+async function waitForReactionApproval({ channel, ts, timeoutMs = 15 * 60 * 1000, pollIntervalMs = 5000, signal } = {}) {
   if (!channel || !ts) throw new Error('waitForReactionApproval requires { channel, ts }');
   const deadline = Date.now() + timeoutMs;
   const botId = await getBotUserId().catch(() => null);
@@ -445,7 +340,7 @@ async function waitForReactionApproval({ channel, ts, timeoutMs = 15 * 60 * 1000
     const res = await fetch(`${SLACK_API}/reactions.get?${params.toString()}`, {
       headers: { authorization: `Bearer ${token()}` },
     });
-    const json = await res.json().catch(() => ({})) as { ok?: boolean; error?: string; message?: { reactions?: Array<{ name?: string; users?: string[] }> } };
+    const json = await res.json().catch(() => ({}));
     if (!json.ok) {
       // 'message_not_found' can happen transiently right after posting. Don't
       // bail on a single API error — just keep polling. Log so it's visible.
@@ -453,13 +348,13 @@ async function waitForReactionApproval({ channel, ts, timeoutMs = 15 * 60 * 1000
     } else {
       const reactions = (json.message && json.message.reactions) || [];
       // Find the first reaction whose user list contains a non-bot user.
-      let earliest: ReactionDecision | null = null;
+      let earliest = null;
       for (const r of reactions) {
         const name = (r.name || '').toLowerCase();
         if (name !== APPROVE_EMOJI && name !== REJECT_EMOJI) continue;
         const realUser = (r.users || []).find((u) => u !== botId);
         if (!realUser) continue;
-        const decision: 'approve' | 'reject' = name === APPROVE_EMOJI ? 'approve' : 'reject';
+        const decision = name === APPROVE_EMOJI ? 'approve' : 'reject';
         // Without per-reaction timestamps from Slack, pick approve over reject
         // when both are present (safer default: human explicitly approved).
         if (!earliest || (decision === 'approve' && earliest.decision === 'reject')) {
@@ -476,7 +371,7 @@ async function waitForReactionApproval({ channel, ts, timeoutMs = 15 * 60 * 1000
     const slices = Math.ceil(pollIntervalMs / sliceMs);
     for (let i = 0; i < slices; i++) {
       if (signal && signal.aborted) return { ok: false, decision: 'aborted' };
-      await new Promise<void>((r) => setTimeout(r, sliceMs));
+      await new Promise((r) => setTimeout(r, sliceMs));
     }
   }
   logger.warn({ channel, ts, polledFor: timeoutMs }, 'Slack reaction approval timed out');
@@ -486,27 +381,21 @@ async function waitForReactionApproval({ channel, ts, timeoutMs = 15 * 60 * 1000
 // Cache the bot's user id so we don't call auth.test on every poll iteration.
 // We need it to filter out the bot's own reactions (we sometimes seed the
 // message with a starter reaction so reviewers see the picker pre-warmed).
-let _botUserId: string | undefined;
-async function getBotUserId(): Promise<string | undefined> {
+let _botUserId;
+async function getBotUserId() {
   if (_botUserId) return _botUserId;
   const res = await fetch(`${SLACK_API}/auth.test`, {
     headers: { authorization: `Bearer ${token()}` },
   });
-  const json = await res.json().catch(() => ({})) as { ok?: boolean; user_id?: string };
+  const json = await res.json().catch(() => ({}));
   if (json.ok && json.user_id) _botUserId = json.user_id;
   return _botUserId;
-}
-
-interface PostFollowUpArgs {
-  channel: string;
-  ts: string;
-  text: string;
 }
 
 // Post a final status line in the same channel so the reviewer sees the
 // outcome of their approval/rejection in context. Non-fatal: if this fails
 // we just log and move on (the order itself still completed).
-async function postFollowUp({ channel, ts, text }: PostFollowUpArgs): Promise<unknown> {
+async function postFollowUp({ channel, ts, text }) {
   try {
     const res = await fetch(`${SLACK_API}/chat.postMessage`, {
       method: 'POST',
@@ -516,7 +405,7 @@ async function postFollowUp({ channel, ts, text }: PostFollowUpArgs): Promise<un
       },
       body: JSON.stringify({ channel, thread_ts: ts, text }),
     });
-    const json = await res.json().catch(() => ({})) as { ok?: boolean; error?: string };
+    const json = await res.json().catch(() => ({}));
     if (!json.ok) logger.warn({ error: json.error }, 'postFollowUp failed');
     return json;
   } catch (err) {
@@ -534,30 +423,11 @@ async function postFollowUp({ channel, ts, text }: PostFollowUpArgs): Promise<un
 // errors, we log and return { ok: false } so the caller's main flow is
 // unaffected. Alerts post to SLACK_ALERT_CHANNEL if set, else fall back to
 // SLACK_APPROVAL_CHANNEL.
-function alertChannel(): string | null {
+function alertChannel() {
   return process.env.SLACK_ALERT_CHANNEL || process.env.SLACK_APPROVAL_CHANNEL || null;
 }
 
-interface AlertField {
-  label?: string;
-  value?: unknown;
-}
-
-interface SendAlertArgs {
-  emoji?: string;
-  title?: string;
-  fields?: AlertField[];
-  text?: string;
-}
-
-interface SendAlertResult {
-  ok: boolean;
-  error?: string;
-  channel?: string;
-  ts?: string;
-}
-
-async function sendAlert({ emoji = ':bell:', title, fields = [], text }: SendAlertArgs = {}): Promise<SendAlertResult> {
+async function sendAlert({ emoji = ':bell:', title, fields = [], text } = {}) {
   const tk = process.env.SLACK_BOT_TOKEN;
   const ch = alertChannel();
   if (!tk || !ch) {
@@ -565,7 +435,7 @@ async function sendAlert({ emoji = ':bell:', title, fields = [], text }: SendAle
     return { ok: false, error: 'not_configured' };
   }
   const headerText = `${emoji} ${title || 'Bot alert'}`.slice(0, 150);
-  const blocks: unknown[] = [
+  const blocks = [
     { type: 'section', text: { type: 'mrkdwn', text: `*${headerText}*` } },
   ];
   const fieldBlocks = (fields || [])
@@ -587,7 +457,7 @@ async function sendAlert({ emoji = ':bell:', title, fields = [], text }: SendAle
       },
       body: JSON.stringify({ channel: ch, text: headerText, blocks }),
     });
-    const json = await res.json().catch(() => ({})) as { ok?: boolean; error?: string; channel?: string; ts?: string };
+    const json = await res.json().catch(() => ({}));
     if (!json.ok) {
       logger.warn({ error: json.error }, 'slack alert chat.postMessage failed');
       return { ok: false, error: json.error || 'unknown' };
@@ -601,7 +471,7 @@ async function sendAlert({ emoji = ':bell:', title, fields = [], text }: SendAle
   }
 }
 
-export {
+module.exports = {
   sendCheckoutApproval,
   uploadScreenshot,
   waitForButtonApproval,

@@ -1,14 +1,14 @@
 'use strict';
 
-import 'dotenv/config';
+require('dotenv/config');
 
-import http from 'http';
-import { logger } from './logger';
-import * as sheetClient from './sheet/sheetClient';
-import * as claudeClient from './claude/claudeClient';
-import { listAccounts, pickAccount } from './accounts/accountPicker';
-import { sendReviewAlert } from './review/reviewQueue';
-import {
+const http = require('http');
+const { logger } = require('./logger');
+const sheetClient = require('./sheet/sheetClient');
+const claudeClient = require('./claude/claudeClient');
+const { listAccounts, pickAccount } = require('./accounts/accountPicker');
+const { sendReviewAlert } = require('./review/reviewQueue');
+const {
   launchContext,
   ensureLoggedIn,
   detectBlockers,
@@ -16,39 +16,26 @@ import {
   setGrubhubOrderType,
   setResidentAddressViaPill,
   clearGrubhubStorage,
-} from './grubhub/browser';
-import { parseNotes, ParsedNotes } from './parse/notesParser';
-import { parseItems } from './parse/itemsParser';
-import { scrapeMenu, searchMenuItems, tryPreorder, switchToPickup } from './grubhub/menuScraper';
-import * as cart from './grubhub/cart';
+} = require('./grubhub/browser');
+const { parseNotes } = require('./parse/notesParser');
+const { parseItems } = require('./parse/itemsParser');
+const { scrapeMenu, searchMenuItems, tryPreorder, switchToPickup } = require('./grubhub/menuScraper');
+const cart = require('./grubhub/cart');
 
 // The notes parser exposes resident* fields; some legacy call sites also read
 // customer* aliases that the parser does not (and never did) populate — at
 // runtime these were simply `undefined`. Model that exactly so the strict
 // compiler accepts the access without changing behavior.
-type ParsedNotesWithAliases = ParsedNotes & {
-  customerFirstName?: string;
-  customerLastName?: string;
-  customerPhone?: string;
-};
 
-type CheckResult = { ok?: boolean; [key: string]: unknown };
-type VerifyResults = {
-  sheet: CheckResult | null;
-  claude: CheckResult | null;
-  accounts: CheckResult | null;
-  slack: CheckResult | null;
-};
-
-async function cmdCheck(): Promise<void> {
+async function cmdCheck() {
   logger.info('--- Day 1 verification ---');
-  const results: VerifyResults = { sheet: null, claude: null, accounts: null, slack: null };
+  const results = { sheet: null, claude: null, accounts: null, slack: null };
 
   try {
     const meta = await sheetClient.verifyConnection();
     results.sheet = { ok: true, title: meta.title, tab: meta.tab };
     logger.info({ title: meta.title, tab: meta.tab }, '[OK] Google Sheets reachable');
-  } catch (err: any) {
+  } catch (err) {
     results.sheet = { ok: false, error: err.message };
     logger.error({ err: err.message }, '[FAIL] Google Sheets');
   }
@@ -58,7 +45,7 @@ async function cmdCheck(): Promise<void> {
     results.claude = { ok: r.ok, model: r.model };
     if (r.ok) logger.info({ model: r.model }, '[OK] Claude API reachable');
     else logger.warn({ text: r.text }, '[WARN] Claude responded but content unexpected');
-  } catch (err: any) {
+  } catch (err) {
     results.claude = { ok: false, error: err.message };
     logger.error({ err: err.message }, '[FAIL] Claude API');
   }
@@ -67,7 +54,7 @@ async function cmdCheck(): Promise<void> {
     const accts = listAccounts();
     results.accounts = { ok: true, count: accts.length, ids: accts.map((a) => a.id) };
     logger.info({ count: accts.length, ids: accts.map((a) => a.id) }, '[OK] Grubhub accounts loaded');
-  } catch (err: any) {
+  } catch (err) {
     results.accounts = { ok: false, error: err.message };
     logger.error({ err: err.message }, '[FAIL] Account config');
   }
@@ -79,10 +66,10 @@ async function cmdCheck(): Promise<void> {
       reason: 'Day 1 connectivity test — no real order data.',
       order: { order_id: 'health-check', account: 'n/a', restaurant_name: 'n/a' },
     });
-    results.slack = slack as unknown as CheckResult;
+    results.slack = slack;
     if (slack.sent) logger.info('[OK] Slack webhook reachable');
     else logger.warn({ slack }, '[WARN] Slack webhook not configured or not reachable');
-  } catch (err: any) {
+  } catch (err) {
     results.slack = { ok: false, error: err.message };
     logger.error({ err: err.message }, '[FAIL] Slack');
   }
@@ -96,7 +83,7 @@ async function cmdCheck(): Promise<void> {
   process.exit(allOk ? 0 : 1);
 }
 
-function cmdLogin(): void {
+function cmdLogin() {
   // Login is no longer handled by the bot. The bot drives the real Chrome you
   // start with `npm run chrome`; sign in there once and the cookies persist in
   // ./chrome-profile.
@@ -110,7 +97,7 @@ function cmdLogin(): void {
   process.exit(0);
 }
 
-async function cmdOrder(): Promise<void> {
+async function cmdOrder() {
   const code = await processOneOrder();
   process.exit(code);
 }
@@ -129,7 +116,7 @@ async function cmdOrder(): Promise<void> {
 // This does a cheap (3s) HTTP probe of Chrome's DevTools endpoint BEFORE any
 // row is locked. Chrome always serves GET /json/version on the debug port.
 // Returns { ok, reason } — ok:false means "pause the queue, touch no rows".
-function preflightChromeReachable(): Promise<{ ok: boolean; reason?: string }> {
+function preflightChromeReachable() {
   const cdpUrl = process.env.BROWSER_CDP_URL;
   if (!cdpUrl) return Promise.resolve({ ok: true }); // launch-own-Chrome mode — nothing to probe
   const probeUrl = cdpUrl.replace(/\/+$/, '') + '/json/version';
@@ -147,13 +134,13 @@ function preflightChromeReachable(): Promise<{ ok: boolean; reason?: string }> {
       req.destroy();
       resolve({ ok: false, reason: `no response from ${probeUrl} within 3s` });
     });
-    req.on('error', (err: any) => {
+    req.on('error', (err) => {
       resolve({ ok: false, reason: `${err.code || err.message} connecting to ${probeUrl}` });
     });
   });
 }
 
-async function processOneOrder(): Promise<number> {
+async function processOneOrder() {
   const DRY_RUN = (process.env.DRY_RUN || 'true').toLowerCase() === 'true';
   const CONFIDENCE_THRESHOLD = parseFloat(process.env.CONFIDENCE_THRESHOLD || '0.85');
   const MIN_AVG_CONFIDENCE = parseFloat(process.env.MIN_AVG_CONFIDENCE || '0.92');
@@ -162,10 +149,10 @@ async function processOneOrder(): Promise<number> {
   const MAX_TOTAL_BASIS = (process.env.MAX_TOTAL_BASIS || 'all_in').toLowerCase();
 
   let exitCode = 0;
-  let browser: Awaited<ReturnType<typeof launchContext>>['browser'] | undefined;
-  let ctx: Awaited<ReturnType<typeof launchContext>> | undefined;
-  let page: Awaited<ReturnType<typeof ensureLoggedIn>> | undefined; // the per-order tab; closed in finally so tabs don't pile up in CDP Chrome
-  let lockedRow: number | null = null;
+  let browser;
+  let ctx;
+  let page; // the per-order tab; closed in finally so tabs don't pile up in CDP Chrome
+  let lockedRow = null;
 
   try {
     // Pre-flight 1: don't lock a row if the debug Chrome isn't even up. Returns
@@ -200,7 +187,7 @@ async function processOneOrder(): Promise<number> {
       'processing order (newest ready row)',
     );
 
-    const parsed = parseNotes(order.notes) as ParsedNotesWithAliases;
+    const parsed = parseNotes(order.notes);
     if (!parsed.isGrubhub || !parsed.orderUrl) {
       await sheetClient.writeReview(order._rowNumber, 'Notes do not contain a Grubhub order URL');
       exitCode = 1;
@@ -239,8 +226,8 @@ async function processOneOrder(): Promise<number> {
     // to the notes value only if the column is blank (legacy rows).
     const addressCol = (order['address'] || '').toString().trim();
     const unitCol = (order['unit'] || '').toString().trim();
-    let deliveryAddress: string;
-    let addressSource: string;
+    let deliveryAddress;
+    let addressSource;
     if (addressCol) {
       // Append the unit only if the column value doesn't already carry one.
       deliveryAddress = unitCol && !/\bunit\b|#/i.test(addressCol)
@@ -317,7 +304,7 @@ async function processOneOrder(): Promise<number> {
     // as a fresh Grubhub before we change the address. Reloads grubhub.com.
     try {
       await clearGrubhubStorage(page);
-    } catch (e: any) {
+    } catch (e) {
       logger.warn({ err: e.message }, 'clearGrubhubStorage failed (continuing)');
     }
 
@@ -325,16 +312,26 @@ async function processOneOrder(): Promise<number> {
     // cart leak in CDP mode and crash-recovery double-adds).
     try {
       await cart.clearCart(page, { saveScreenshot });
-    } catch (e: any) {
+    } catch (e) {
       logger.warn({ err: e.message }, 'pre-run cart clear failed (continuing)');
     }
 
-    // Set delivery vs pickup BEFORE navigating to the restaurant page.
-    // Grubhub reads ngStorage-cartState.orderType on SPA mount; there's no
-    // visible tab to switch later. parsed.orderType comes from the notes
-    // ("Store: Wawa - Delivery Order" → "delivery").
+    // STEP 1 — set delivery vs pickup on the HOMEPAGE (grubhub.com/lets-eat),
+    // BEFORE the address and BEFORE navigating to the restaurant. The homepage
+    // global nav carries the real Delivery/Pickup toggle (#delivery-button /
+    // #pickup-button, role=button, aria-pressed). Setting ngStorage-cartState via
+    // localStorage alone does NOT flip that visible toggle, so we also CLICK it
+    // here: the session — and the restaurant page we open next — then start in
+    // the right mode. This is essential for pickup at a restaurant that doesn't
+    // deliver to the address (otherwise it stays on Delivery and every add
+    // fails). Order per the workflow: toggle → address → restaurant URL.
     if (parsed.orderType) {
       await setGrubhubOrderType(page, parsed.orderType);
+      const homeToggle = await cart.ensureOrderType(page, parsed.orderType).catch((e) => {
+        logger.warn({ err: e.message }, 'homepage order-type toggle threw (continuing)');
+        return { changed: false, err: 'threw' };
+      });
+      logger.info({ ...homeToggle, wanted: parsed.orderType }, 'order type toggle set on HOMEPAGE (pre-navigation)');
     }
 
     // Swap to the resident's delivery address on the Grubhub HOMEPAGE — before
@@ -343,31 +340,39 @@ async function processOneOrder(): Promise<number> {
     // the restaurant page loads with the correct address from the start, so
     // Grubhub never fires the "Outside of delivery range" modal that would
     // otherwise block the pill on the restaurant page. Pickup orders skip.
-    if (!isPickup && deliveryAddress) {
+    // STEP 2 — set the resident address pill on the homepage, for BOTH delivery
+    // AND pickup (per spec: "whether pickup or delivery, you just change the
+    // address"). For DELIVERY a failed swap is fatal (would order to the wrong
+    // location → human review). For PICKUP it's best-effort: pickup is fulfilled
+    // at the restaurant, so a pill miss isn't fatal — set it and continue.
+    if (deliveryAddress) {
       const pillOk = await setResidentAddressViaPill(page, deliveryAddress).catch(
-        (e: any) => {
+        (e) => {
           logger.warn({ err: e.message }, 'setResidentAddressViaPill threw on homepage (continuing)');
           return false;
         },
       );
-      logger.info({ pillOk }, 'resident address pill set on homepage (pre-navigation)');
+      logger.info({ pillOk, isPickup }, 'resident address pill set on homepage (pre-navigation)');
       await saveScreenshot(page, 'address-pill-set-homepage');
-      addressReady = pillOk;
-      if (!pillOk) {
-        await sheetClient.writeReview(
-          order._rowNumber,
-          'Address pill swap failed — pill still shows account address, refusing to proceed (would order to wrong location)',
-        );
-        lockedRow = null;
-        await sendReviewAlert({
-          severity: 'warn',
-          title: 'Address swap failed',
-          reason: `Could not change Grubhub session address to "${deliveryAddress}". Pill click + Update did not register a verified address change.`,
-          order: { order_id: order.id, account: account.id, restaurant_name: parsed.store, max_total: parsed.maxTotal },
-        });
-        exitCode = 1;
-        return exitCode;
+      if (!isPickup) {
+        addressReady = pillOk;
+        if (!pillOk) {
+          await sheetClient.writeReview(
+            order._rowNumber,
+            'Address pill swap failed — pill still shows account address, refusing to proceed (would order to wrong location)',
+          );
+          lockedRow = null;
+          await sendReviewAlert({
+            severity: 'warn',
+            title: 'Address swap failed',
+            reason: `Could not change Grubhub session address to "${deliveryAddress}". Pill click + Update did not register a verified address change.`,
+            order: { order_id: order.id, account: account.id, restaurant_name: parsed.store, max_total: parsed.maxTotal },
+          });
+          exitCode = 1;
+          return exitCode;
+        }
       }
+      // pickup: addressReady stays true (best-effort pill), proceed regardless
     }
 
     // Hard ordering guard: never open the restaurant URL for a delivery order
@@ -405,7 +410,7 @@ async function processOneOrder(): Promise<number> {
     if (menu.count === 0 && menu.reason === 'out_of_range' && !isPickup && deliveryAddress) {
       logger.warn('out-of-range modal on restaurant page — retrying address via Change');
       await saveScreenshot(page, 'out-of-range-before-recovery');
-      const recovered = await setResidentAddressViaPill(page, deliveryAddress).catch((e: any) => {
+      const recovered = await setResidentAddressViaPill(page, deliveryAddress).catch((e) => {
         logger.warn({ err: e.message }, 'out-of-range recovery threw (continuing)');
         return false;
       });
@@ -426,7 +431,7 @@ async function processOneOrder(): Promise<number> {
       await saveScreenshot(page, 'pickup-only-modal');
       if (isPickup) {
         logger.info('pickup-only modal on a pickup order — clicking "Switch to pickup"');
-        const switched = await switchToPickup(page).catch((e: any) => {
+        const switched = await switchToPickup(page).catch((e) => {
           logger.warn({ err: e.message }, 'switchToPickup threw (continuing)');
           return false;
         });
@@ -450,13 +455,36 @@ async function processOneOrder(): Promise<number> {
       }
     }
 
-    // Preorder is triggered in two cases:
+    // Preorder is triggered in THREE cases (applies to pickup AND delivery):
     //   1. Notes carry a target time — pick the slot nearest that time.
     //   2. Restaurant is closed and ALLOW_PREORDER=true — pick earliest slot.
+    //   3. Grubhub is showing a schedule/preorder modal RIGHT NOW (the place
+    //      only takes scheduled orders at this time) and ALLOW_PREORDER=true —
+    //      handle it even if the menu rendered behind the modal.
     const allowPreorder = (process.env.ALLOW_PREORDER || '').toLowerCase() === 'true';
-    const shouldPreorder = parsed.targetTime || (menu.count === 0 && menu.reason === 'restaurant_closed' && allowPreorder);
+    // Closed / preorder-only restaurants auto-open a "Schedule my order" modal a
+    // few seconds after the page settles — a single 1s check raced it and missed
+    // it, so the bot tried to search/match/add against a page that wasn't
+    // actually orderable. Poll for the modal with early exit: a closed place
+    // surfaces it within ~1-3s; an open place never does (we eat the cap once).
+    // Handle preorder FIRST — before search/match/add.
+    const preorderModalLoc = page
+      .locator('[role="dialog"], [aria-modal="true"]')
+      .filter({ hasText: /schedule (my )?order|select a (delivery|pickup) time|preorder|order for later|choose a (delivery|pickup )?time|not (currently )?(open|accepting)/i })
+      .first();
+    let preorderModalUp = false;
+    {
+      const preDeadline = Date.now() + (allowPreorder ? 6000 : 1000);
+      while (Date.now() < preDeadline) {
+        if (await preorderModalLoc.isVisible({ timeout: 500 }).catch(() => false)) { preorderModalUp = true; break; }
+        await page.waitForTimeout(300);
+      }
+    }
+    const shouldPreorder = !!parsed.targetTime
+      || (preorderModalUp && allowPreorder)
+      || (menu.count === 0 && menu.reason === 'restaurant_closed' && allowPreorder);
     if (shouldPreorder) {
-      logger.info({ targetTime: parsed.targetTime, menuCount: menu.count }, 'attempting preorder');
+      logger.info({ preorderModalUp, targetTime: parsed.targetTime, menuCount: menu.count, reason: menu.reason }, 'preorder condition met — attempting preorder');
       const pre = await tryPreorder(page, { saveScreenshot, targetTime: parsed.targetTime ?? undefined });
       logger.info({ pre }, 'preorder attempt result');
       if (pre.ok) {
@@ -468,8 +496,8 @@ async function processOneOrder(): Promise<number> {
     if (menu.count === 0) {
       await saveScreenshot(page, 'menu-empty');
       const visibleText = (menu.closedSignal && menu.closedSignal.text) || '';
-      let reason: string;
-      let title: string;
+      let reason;
+      let title;
       if (menu.reason === 'out_of_range') {
         reason = `Restaurant marked unorderable for this delivery address — check that the pill swap worked. Visible: "${visibleText.slice(0, 200)}"`;
         title = 'Restaurant out of delivery range (address may be wrong)';
@@ -522,7 +550,7 @@ async function processOneOrder(): Promise<number> {
           menu.count = deepMenu.count;
         }
       }
-    } catch (e: any) {
+    } catch (e) {
       logger.warn({ err: e.message }, 'search-first discovery failed — falling back to deep scrape');
       const deepMenu = await scrapeMenu(page, { deep: true }).catch(() => null);
       if (deepMenu && deepMenu.items && deepMenu.items.length) {
@@ -538,12 +566,23 @@ async function processOneOrder(): Promise<number> {
     //       preferring exact over fuzzy and high-confidence over low.
     // parsed.maxTotal is the subtotal cap; fees/tax/tip are enforced
     // separately at checkout via MAX_TOTAL_BASIS=all_in.
-    const match = await claudeClient.matchItemsBudgetAware({
+    // DIAGNOSTIC: dump the exact candidate set Claude will match against, so a
+    // "0 candidates" result is explainable (wrong cards surfaced vs. real item
+    // missing vs. confidence too low).
+    logger.info(
+      {
+        requested: items.map((i) => i.name),
+        candidateCount: (menu.items || []).length,
+        candidates: (menu.items || []).map((it) => `${it.name} | ${it.price != null ? '$' + it.price : 'n/a'}`),
+      },
+      'MATCH INPUT — candidate set going into rankCandidates',
+    );
+    let match = await claudeClient.matchItemsBudgetAware({
       requestedItems: items.map((i) => ({ name: i.name, qty: i.qty })),
       menu: { items: menu.items },
       // parsed.maxTotal is number|null; the original code passed it through
       // as-is (null when the notes carried no cap). Preserve that exactly.
-      maxTotal: parsed.maxTotal as number,
+      maxTotal: parsed.maxTotal,
       confidenceThreshold: CONFIDENCE_THRESHOLD,
     });
 
@@ -552,15 +591,96 @@ async function processOneOrder(): Promise<number> {
       'budget-aware match result',
     );
 
+    // RECOVERY when the match fails for a CANDIDATE reason (not over-budget).
+    // Search-first is fast but can't surface every item — Red Lobster's search
+    // box returns "popular/related" cards, so a side/Kids item like "Macaroni &
+    // Cheese" never shows up (only fuzzy junk: Chocolate Wave, etc.). The
+    // 06-16 run that worked end-to-end matched it via the FULL MENU SCRAPE, so
+    // restore that as the fallback. It is now SAFE: preorder is handled before
+    // we get here, so the deep scrape no longer trips the closed/schedule modal
+    // (the bug that made it look like the restaurant was closed).
+    if (!match.withinBudget && /no qualifying candidates|no items to match|no candidates/i.test(match.reason || '')) {
+      try {
+        // First, if a schedule modal is somehow still up, clear it via preorder
+        // so the deep scrape walks an orderable menu.
+        const lateModalUp = await preorderModalLoc.isVisible({ timeout: 800 }).catch(() => false);
+        if (lateModalUp && allowPreorder) {
+          logger.info('schedule modal still up before deep-scrape recovery — handling preorder');
+          await tryPreorder(page, { saveScreenshot, targetTime: parsed.targetTime ?? undefined }).catch(() => {});
+        }
+        logger.info({ reason: match.reason }, 'search candidates missing an item — full menu scrape + re-match (the 06-16 path)');
+        const deepMenu = await scrapeMenu(page, { deep: true });
+        if (deepMenu && deepMenu.items && deepMenu.items.length) {
+          // Merge: full menu wins, but keep any search-only hits too.
+          const byName = new Map(deepMenu.items.map((it) => [it.name.toLowerCase(), it]));
+          for (const it of (menu.items || [])) {
+            const k = it.name.toLowerCase();
+            if (!byName.has(k)) byName.set(k, it);
+          }
+          const mergedItems = Array.from(byName.values());
+          const match2 = await claudeClient.matchItemsBudgetAware({
+            requestedItems: items.map((i) => ({ name: i.name, qty: i.qty })),
+            menu: { items: mergedItems },
+            maxTotal: parsed.maxTotal,
+            confidenceThreshold: CONFIDENCE_THRESHOLD,
+          });
+          logger.info(
+            {
+              fromDeep: deepMenu.items.length,
+              totalCandidates: mergedItems.length,
+              withinBudget: match2.withinBudget,
+              reason: match2.reason,
+              macInMenu: mergedItems.filter((it) => /macaroni|mac\s*[&n]|mac and/i.test(it.name)).map((it) => `${it.name} | ${it.price != null ? '$' + it.price : 'n/a'}`),
+            },
+            'budget-aware re-match after full menu scrape',
+          );
+          menu.items = mergedItems;
+          match = match2;
+        }
+      } catch (e) {
+        logger.warn({ err: e.message }, 'full-scrape re-match failed (keeping original match result)');
+      }
+    }
+
     if (!match.withinBudget) {
-      // A budget mismatch MUST always land in needs-review — never a hard
+      // A match failure MUST always land in needs-review — never a hard
       // "Order failed". So build the message defensively: start with safe
       // fallbacks, and if anything in the (data-dependent) message building
       // throws, keep the fallbacks instead of letting the error escape to the
       // outer catch (which would mark the order Failed).
+      //
+      // TWO distinct failure modes, two different messages — the old code
+      // always said "over budget", which was wrong/confusing when the real
+      // problem was that an item had NO confident menu match. Detect which:
+      //   - confidence/no-match  → "couldn't confidently match item(s)"
+      //   - actual budget overflow → "cheapest combo exceeds max"
+      const isNoMatch = /no qualifying candidates|no candidates|no match|no items to match|not found/i.test(match.reason || '');
       let sheetReason = (match.reason || 'Items could not be matched within budget') + ' — needs review';
       let slackReason = sheetReason;
+      let alertTitle = '🛑 Order over budget — needs review';
       try {
+        if (isNoMatch) {
+          // Confidence / no-match failure: show which requested items did or
+          // didn't find a menu match, NOT a budget pitch.
+          const breakdown = (match.rankedRaw || [])
+            .map((row) => {
+              const best = (row.candidates || [])
+                .slice()
+                .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0))[0];
+              if (!best) return `• ${row.requested} → no menu match found`;
+              const conf = best.confidence != null ? ` (conf ${(best.confidence).toFixed(2)})` : '';
+              const priceStr = best.matched_price != null ? ` $${best.matched_price.toFixed(2)}` : '';
+              return `• ${row.requested} → ${best.matched_name}${priceStr}${conf}`;
+            })
+            .join('\n');
+          alertTitle = '🔎 Couldn’t confidently match an item — needs review';
+          sheetReason = (match.reason || 'One or more items had no confident menu match') + ' — needs review';
+          slackReason =
+            `Couldn't confidently match one or more requested items to the menu.\n\n` +
+            `*Closest candidate per item:*\n${breakdown || '• (no candidates returned)'}\n\n` +
+            `_Threshold is ${CONFIDENCE_THRESHOLD}. To proceed: lower it, fix the item name, or pick manually._`;
+          throw { __handled: true };
+        }
         const maxTotal = Number(parsed.maxTotal) || 0;
         // Cheapest combo Grubhub could actually build (one match per requested item).
         const cheapest = (match.attempts || []).find((a) => a.label === 'cheapest-available')
@@ -590,21 +710,25 @@ async function processOneOrder(): Promise<number> {
         slackReason =
           `This order can't fit the $${maxTotal.toFixed(2)} budget.\n` +
           (cheapestTotal != null
-            ? `Cheapest possible combo is *$${cheapestTotal.toFixed(2)}* — over by *$${over!.toFixed(2)}*.\n\n`
+            ? `Cheapest possible combo is *$${cheapestTotal.toFixed(2)}* — over by *$${over.toFixed(2)}*.\n\n`
             : '\n') +
           `*Best price per item:*\n${breakdown}\n\n` +
           `_To proceed: raise the max total or remove/swap an item._`;
-      } catch (msgErr: any) {
-        logger.warn({ err: msgErr.message }, 'budget-review message build failed — using safe fallback reason (still needs-review, not failed)');
+      } catch (msgErr) {
+        // __handled is our own control-flow signal for the no-match branch
+        // (message already built) — not a real error, so don't warn on it.
+        if (!(msgErr && msgErr.__handled)) {
+          logger.warn({ err: msgErr.message }, 'review message build failed — using safe fallback reason (still needs-review, not failed)');
+        }
       }
 
-      await sheetClient.writeReview(order._rowNumber, String(sheetReason).slice(0, 500)).catch((e: any) => {
+      await sheetClient.writeReview(order._rowNumber, String(sheetReason).slice(0, 500)).catch((e) => {
         logger.warn({ err: e.message }, 'writeReview failed for budget mismatch');
       });
       lockedRow = null;
       await sendReviewAlert({
         severity: 'warn',
-        title: '🛑 Order over budget — needs review',
+        title: alertTitle,
         reason: slackReason,
         order: { order_id: order.id, account: account.id, restaurant_name: parsed.store, max_total: parsed.maxTotal },
       }).catch(() => {});
@@ -620,6 +744,19 @@ async function processOneOrder(): Promise<number> {
     ).catch(() => {});
 
     // Phase 3 — add the budget-approved picks to the cart.
+    // Final preorder guard: a closed/preorder-only restaurant's "Schedule my
+    // order" modal can still be (or newly be) up here and would block every
+    // add-to-cart. If it's showing, handle the preorder now so the menu is
+    // actually orderable before we start clicking items.
+    if (allowPreorder || parsed.targetTime) {
+      const modalBeforeAdd = await preorderModalLoc.isVisible({ timeout: 800 }).catch(() => false);
+      if (modalBeforeAdd) {
+        logger.info('schedule modal still up before add — handling preorder before adding to cart');
+        const preAdd = await tryPreorder(page, { saveScreenshot, targetTime: parsed.targetTime ?? undefined });
+        logger.info({ preAdd }, 'pre-add preorder attempt result');
+      }
+    }
+
     const cartItems = match.picks.map((p) => ({
       requested: p.requested,
       matched_id: null,
@@ -638,7 +775,7 @@ async function processOneOrder(): Promise<number> {
     if (addRes.skipped.length) {
       const reason =
         `Phase 3: ${addRes.skipped.length} item(s) could not be added — ` +
-        addRes.skipped.map((s: any) => `${s.name} (${s.reason})`).join('; ');
+        addRes.skipped.map((s) => `${s.name} (${s.reason})`).join('; ');
       await sheetClient.writeReview(order._rowNumber, reason.slice(0, 500));
       lockedRow = null;
       await sendReviewAlert({
@@ -730,13 +867,7 @@ async function processOneOrder(): Promise<number> {
     // the account's name/phone; we overwrite it with the row's values.
     // Declared outside the try so the post-fill confirmation wait below can
     // read the same values (a `const` inside try would be out of scope there).
-    let contact: {
-      firstName: string | undefined;
-      lastName: string | undefined;
-      phone: string | undefined;
-      unit: string;
-      specialInstructions: string;
-    } | null = null;
+    let contact = null;
     try {
       // The SHEET ROW columns (first_name/last_name/cell_phone) are the source
       // of truth for the resident — they MUST win over anything parsed from the
@@ -760,7 +891,7 @@ async function processOneOrder(): Promise<number> {
         'filling checkout contact from sheet row',
       );
       await cart.fillCheckoutContact(page, contact);
-    } catch (e: any) {
+    } catch (e) {
       logger.warn({ err: e.message }, 'fillCheckoutContact threw (continuing — fields may already be set)');
     }
     // Wait until the SPA has actually committed the just-filled fields before
@@ -771,14 +902,14 @@ async function processOneOrder(): Promise<number> {
     // skipped/optional field never hangs the run.
     if (contact) {
       await page.waitForFunction(
-        (c: { firstName?: string; lastName?: string; phone?: string; unit?: string }) => {
-          const val = (sel: string) => {
-            const el = document.querySelector(sel) as HTMLInputElement | null;
+        (c) => {
+          const val = (sel) => {
+            const el = document.querySelector(sel);
             return el ? String(el.value || '').trim() : '';
           };
-          const okName = (sel: string, want?: string) =>
+          const okName = (sel, want) =>
             !want || val(sel).toLowerCase() === String(want).trim().toLowerCase();
-          const okFilled = (sel: string, want?: string) => !want || val(sel).length > 0;
+          const okFilled = (sel, want) => !want || val(sel).length > 0;
           return (
             okName('#firstName', c.firstName) &&
             okName('#lastName', c.lastName) &&
@@ -820,7 +951,7 @@ async function processOneOrder(): Promise<number> {
           rowNumber: order._rowNumber,
           dryRun: true,
         });
-      } catch (e: any) {
+      } catch (e) {
         logger.warn({ err: e.message }, 'dry-run approval preview post failed (continuing)');
       }
       // Write a non-ready state so the loop advances to the next row instead
@@ -855,7 +986,7 @@ async function processOneOrder(): Promise<number> {
       ).catch(() => {
         logger.warn('did not reach gather/review URL within 8s after gather submit');
       });
-    } catch (e: any) {
+    } catch (e) {
       logger.warn({ err: e.message }, 'submitCheckoutGather threw (continuing)');
     }
     await saveScreenshot(page, 'phase5b-after-gather-submit');
@@ -998,7 +1129,7 @@ async function processOneOrder(): Promise<number> {
       { rowNumber: order._rowNumber, grubhubOrderId: placed.grubhubOrderId, total: checkoutTotal },
       'order placed successfully',
     );
-  } catch (err: any) {
+  } catch (err) {
     logger.error({ err: err.message, code: err.code, stack: err.stack }, 'order failed');
     if (lockedRow) {
       await sheetClient.writeFailure(lockedRow, err.message).catch(() => {});
@@ -1041,12 +1172,12 @@ async function processOneOrder(): Promise<number> {
 //   - SESSION_EXPIRED (Chrome got signed out) → sleep 60s. Avoids burning
 //     through the whole queue marking every row failed before the human can
 //     re-sign in. Hold for the user to act.
-async function cmdRun(): Promise<void> {
+async function cmdRun() {
   const pollMs = Math.max(5000, parseInt(process.env.POLL_INTERVAL_MS || '300000', 10));
   logger.info({ pollMs }, 'starting run loop (Ctrl+C to stop)');
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const code = await processOneOrder().catch((err: any) => {
+    const code = await processOneOrder().catch((err) => {
       logger.error({ err: err.message, stack: err.stack }, 'processOneOrder threw unexpectedly');
       return 1;
     });
@@ -1065,15 +1196,15 @@ async function cmdRun(): Promise<void> {
 // /trigger the moment a new row lands, kicking off order processing instantly
 // instead of waiting for the next poll. A fallback poll still runs as a safety
 // net in case a webhook is missed (network blip, tunnel down).
-async function cmdServe(): Promise<void> {
+async function cmdServe() {
   // Lazy dynamic import: server.ts imports this module, so a top-level import
   // would create a circular import. Resolve it only when serve runs.
-  const { startServer } = await import('./server');
+  const { startServer } = require('./server');
   await startServer({ processOneOrder });
   // Keep the process alive; startServer holds the HTTP listener open.
 }
 
-async function cmdQueueTest(): Promise<void> {
+async function cmdQueueTest() {
   const url = process.env.TEST_URL
     || 'https://www.grubhub.com/restaurant/the-melt---925-market-sf-925-market-st-san-francisco/2028596';
   const store = process.env.TEST_STORE || 'The Melt - 925 Market SF';
@@ -1100,7 +1231,7 @@ async function cmdQueueTest(): Promise<void> {
   process.exit(0);
 }
 
-async function main(): Promise<void> {
+async function main() {
   const [, , cmd, ...rest] = process.argv;
   // Single-instance guard for any command that processes orders. Two bots
   // running at once would each have their own in-memory drain lock and could
@@ -1129,12 +1260,12 @@ async function main(): Promise<void> {
   }
 }
 
-export { processOneOrder };
+module.exports = { processOneOrder };
 
 // Only run the CLI when invoked directly (node src/index.js ...). When this
 // module is require()'d (e.g. by src/server.js), skip the CLI dispatch.
 if (require.main === module) {
-  main().catch((err: any) => {
+  main().catch((err) => {
     logger.error({ err: err.message, stack: err.stack }, 'fatal');
     process.exit(1);
   });

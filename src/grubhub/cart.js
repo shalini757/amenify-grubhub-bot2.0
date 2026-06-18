@@ -1,62 +1,11 @@
-/// <reference lib="dom" />
-
-import * as fs from 'fs';
-import * as path from 'path';
-import type { Page, Locator, ElementHandle } from 'playwright';
-import { logger } from '../logger';
-import { BotError, detectBlockers, dismissPopups } from './browser';
-
-// ---- Shared types ----
-
-type SaveScreenshot = (page: Page, label: string) => Promise<unknown>;
-
-interface ModifierOption {
-  text: string;
-  upcharge: number;
-}
-
-interface ModifierSection {
-  key: string | null;
-  title: string;
-  required: boolean;
-  selectMax: number;
-  options: ModifierOption[];
-}
-
-interface MatchedItem {
-  matched_name: string;
-  requested?: string;
-  qty?: number;
-  category?: string;
-  [key: string]: unknown;
-}
-
-interface AddedEntry {
-  name: string;
-  qty: number;
-  before: number | null;
-  after: number | null;
-  via?: string;
-  badgeBumped?: boolean;
-  cartCount: number;
-}
-
-interface SkippedEntry {
-  name: string;
-  reason: string;
-}
-
-interface AddItemsResult {
-  added: AddedEntry[];
-  skipped: SkippedEntry[];
-  initialBadge: number | null;
-}
-
-type ModifierPreferences = Record<string, string>;
+const fs = require('fs');
+const path = require('path');
+const { logger } = require('../logger');
+const { BotError, detectBlockers, dismissPopups } = require('./browser');
 
 // Tiny helper: dismiss any open popup, swallow errors. Wraps the cross-
 // module call so callers don't need to handle the no-popup case.
-async function safeDismiss(page: Page): Promise<void> {
+async function safeDismiss(page) {
   try { await dismissPopups(page); } catch (_) { /* non-fatal */ }
 }
 
@@ -76,7 +25,7 @@ async function safeDismiss(page: Page): Promise<void> {
 // "Select your toasting option"  → "toasting"
 // "Select your cheese"           → "cheese"
 // Returns lower-case key, or null if the title doesn't match.
-function deriveCategoryKey(title: string | null | undefined): string | null {
+function deriveCategoryKey(title) {
   const m = String(title || '').match(/select your\s+(.+?)(?:\s+option)?\s*$/i);
   return m ? m[1].toLowerCase().trim().split(/\s+/)[0] : null;
 }
@@ -94,13 +43,13 @@ function deriveCategoryKey(title: string | null | undefined): string | null {
 // it (waiting briefly for the options to mount). Without this, every
 // required section that wasn't already open would appear to have no
 // options, and Claude would have nothing to pick from.
-async function scrapeModifierModal(page: Page): Promise<ModifierSection[]> {
+async function scrapeModifierModal(page) {
   // First, expand every panel that looks required. Done one at a time
   // so each click+wait completes before the next.
   const panelTitles = await page.$$('[data-testid="expansion-panel-title"]').catch(() => []);
   for (const titleEl of panelTitles) {
     const needsExpand = await titleEl
-      .evaluate((el: HTMLElement) => {
+      .evaluate((el) => {
         const panel = el.parentElement;
         if (!panel) return false;
         const text = (el.innerText || '').trim();
@@ -114,14 +63,14 @@ async function scrapeModifierModal(page: Page): Promise<ModifierSection[]> {
       })
       .catch(() => false);
     if (!needsExpand) continue;
-    await titleEl.evaluate((el: HTMLElement) => el.scrollIntoView({ block: 'center' })).catch(() => {});
+    await titleEl.evaluate((el) => el.scrollIntoView({ block: 'center' })).catch(() => {});
 
     // Same 4-strategy expansion as fillRequiredModifiers — see comments there.
-    async function waitReady(ms: number): Promise<boolean> {
+    async function waitReady(ms) {
       const dl = Date.now() + ms;
       while (Date.now() < dl) {
         const ok = await titleEl
-          .evaluate((el: HTMLElement) => {
+          .evaluate((el) => {
             const panel = el.parentElement;
             return !!(panel && panel.querySelector('[data-testid="emi-childOptions-submodifierBtn"], .emi-submodifier-btn'));
           })
@@ -135,43 +84,37 @@ async function scrapeModifierModal(page: Page): Promise<ModifierSection[]> {
     await titleEl.click({ timeout: 1200 }).catch(() => {});
     let ready = await waitReady(1500);
     if (!ready) {
-      await titleEl.evaluate((el: HTMLElement) => {
-        const tab = (el.parentElement || el).querySelector('[role="tab"]') as HTMLElement | null;
+      await titleEl.evaluate((el) => {
+        const tab = (el.parentElement || el).querySelector('[role="tab"]');
         if (tab) tab.click();
       }).catch(() => {});
       ready = await waitReady(1200);
     }
     if (!ready) {
-      await titleEl.evaluate((el: HTMLElement) => {
-        const icon = (el.querySelector('.cb-icon-wrapper') || el.querySelector('svg.cb-icon')) as HTMLElement | null;
+      await titleEl.evaluate((el) => {
+        const icon = (el.querySelector('.cb-icon-wrapper') || el.querySelector('svg.cb-icon'));
         if (icon) icon.click();
       }).catch(() => {});
       ready = await waitReady(1200);
     }
     if (!ready) {
-      await titleEl.evaluate((el: HTMLElement) => el.click()).catch(() => {});
+      await titleEl.evaluate((el) => el.click()).catch(() => {});
       await waitReady(1200);
     }
   }
 
   return await page
     .evaluate(() => {
-      const visible = (el: Element) => {
+      const visible = (el) => {
         const r = el.getBoundingClientRect();
         if (r.width < 1 || r.height < 1) return false;
         const s = window.getComputedStyle(el);
         return s.visibility !== 'hidden' && s.display !== 'none';
       };
       const dialog = document.querySelector('[role="dialog"], [aria-modal="true"], body.openDialog');
-      const root: Element = dialog || document.body;
-      const panels = Array.from(root.querySelectorAll('[data-testid="expansion-panel-title"]')) as HTMLElement[];
-      const sections: Array<{
-        key: string | null;
-        title: string;
-        required: boolean;
-        selectMax: number;
-        options: Array<{ text: string; upcharge: number }>;
-      }> = [];
+      const root = dialog || document.body;
+      const panels = Array.from(root.querySelectorAll('[data-testid="expansion-panel-title"]'));
+      const sections = [];
       for (const titleEl of panels) {
         if (!visible(titleEl)) continue;
         const title = (titleEl.innerText || '').trim();
@@ -192,14 +135,14 @@ async function scrapeModifierModal(page: Page): Promise<ModifierSection[]> {
           '[data-testid="emi-childOptions-submodifierBtn"], .emi-submodifier-btn, ' +
           'input[type="radio"]:not([disabled]), input[type="checkbox"]:not([disabled]), ' +
           '[role="radio"]:not([aria-disabled="true"]), [role="checkbox"]:not([aria-disabled="true"])'
-        )) as HTMLElement[];
-        const options: Array<{ text: string; upcharge: number }> = [];
+        ));
+        const options = [];
         for (const node of optionNodes) {
           const own = (node.innerText || '').trim();
           let text = own;
           if (!/\+\s*\$/.test(own)) {
             const container = (node.closest('label, [role="row"], li, [data-testid*="modifier"], [data-testid*="option"]') ||
-              node.parentElement || node) as HTMLElement;
+              node.parentElement || node);
             text = (container.innerText || '').trim();
           }
           if (!text) continue;
@@ -222,12 +165,12 @@ async function scrapeModifierModal(page: Page): Promise<ModifierSection[]> {
 // (word-boundary, then substring) instead of by upcharge. Returns true if
 // the click landed; false otherwise so the caller can fall back to cheapest.
 async function clickModifierByText(
-  page: Page,
-  { sectionKey, optionText }: { sectionKey: string; optionText: string },
-): Promise<boolean> {
+  page,
+  { sectionKey, optionText },
+) {
   // Find the panel matching this section key.
   const panel = await page.evaluateHandle((key) => {
-    const titles = Array.from(document.querySelectorAll('[data-testid="expansion-panel-title"]')) as HTMLElement[];
+    const titles = Array.from(document.querySelectorAll('[data-testid="expansion-panel-title"]'));
     for (const t of titles) {
       const titleText = (t.innerText || '').trim();
       const m = titleText.match(/select your\s+(.+?)(?:\s+option)?\s*$/i);
@@ -241,15 +184,15 @@ async function clickModifierByText(
   if (!panelEl) return false;
 
   // Expand the panel first if collapsed.
-  await panelEl.evaluate((el: Element) => {
-    const title = el.querySelector('[data-testid="expansion-panel-title"]') as HTMLElement | null;
+  await panelEl.evaluate((el) => {
+    const title = el.querySelector('[data-testid="expansion-panel-title"]');
     if (title) title.scrollIntoView({ block: 'center' });
   }).catch(() => {});
 
-  const clicked = await panelEl.evaluate((root: Element, wanted) => {
+  const clicked = await panelEl.evaluate((root, wanted) => {
     const needle = String(wanted || '').toLowerCase().trim();
     if (!needle) return false;
-    const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const wordRe = new RegExp('\\b' + escape(needle) + '\\b', 'i');
     const sels = [
       '[data-testid="emi-childOptions-submodifierBtn"]',
@@ -260,12 +203,12 @@ async function clickModifierByText(
       '[role="checkbox"]:not([aria-disabled="true"])',
     ];
     for (const sel of sels) {
-      const nodes = Array.from(root.querySelectorAll(sel)) as HTMLElement[];
+      const nodes = Array.from(root.querySelectorAll(sel));
       if (!nodes.length) continue;
       const scored = nodes.map((node) => {
         const own = (node.innerText || '').trim();
         const container = (node.closest('label, [role="row"], li, [data-testid*="modifier"], [data-testid*="option"]') ||
-          node.parentElement || node) as HTMLElement;
+          node.parentElement || node);
         const containerText = (container.innerText || '').trim();
         const text = (own || containerText).toLowerCase();
         return { node, text };
@@ -285,17 +228,10 @@ async function clickModifierByText(
   return clicked;
 }
 
-interface FillRequiredModifiersOptions {
-  saveScreenshot?: SaveScreenshot;
-  label?: string;
-  preferences?: ModifierPreferences;
-  itemName?: string;
-}
-
 async function fillRequiredModifiers(
-  page: Page,
-  { saveScreenshot, label, preferences = {}, itemName }: FillRequiredModifiersOptions = {},
-): Promise<boolean> {
+  page,
+  { saveScreenshot, label, preferences = {}, itemName } = {},
+) {
   // Claude path: when MODIFIER_MODE=claude is set, scrape the modal into
   // structured JSON, ask Claude to pick sensible defaults for each required
   // section, then click each pick by text. Falls back to the local-defaults
@@ -311,9 +247,9 @@ async function fillRequiredModifiers(
       } else {
         // Skip sections the notes already cover — preferences win.
         const claudeSections = required.filter((s) => !(s.key && preferences[s.key]));
-        let picks: Array<{ sectionKey: string; optionText: string; reason?: string }> = [];
+        let picks = [];
         if (claudeSections.length) {
-          const { pickModifiers } = await import('../claude/claudeClient');
+          const { pickModifiers } = require('../claude/claudeClient');
           const res = await pickModifiers({ itemName: itemName || label || 'item', sections: claudeSections });
           picks = Array.isArray(res.picks) ? res.picks : [];
         }
@@ -343,7 +279,13 @@ async function fillRequiredModifiers(
     }
   }
 
-  for (let attempt = 0; attempt < 12; attempt++) {
+  // Guard against grinding all attempts on a panel that won't expand or whose
+  // pick never registers (the ~90s hang seen on some Kids-side modals): if the
+  // SAME required section is still the blocker across repeated attempts, stop
+  // the structured loop early and let the CTA sweep (caller) take over.
+  let stuckTitle = null;
+  let stuckCount = 0;
+  for (let attempt = 0; attempt < 8; attempt++) {
     // Pick the next unfilled required panel. Wawa marks it two different ways:
     //   1. Panel-title element has class `emi-invalid-item` (original signal)
     //   2. Section heading text literally says "(Required)" but the
@@ -356,18 +298,31 @@ async function fillRequiredModifiers(
     //  no checked input). Return the panel-title element handle.
     const invalidSectionHandle = await page
       .evaluateHandle(() => {
-        const visible = (el: Element) => {
+        const visible = (el) => {
           const r = el.getBoundingClientRect();
           const s = window.getComputedStyle(el);
           return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
         };
-        const titles = Array.from(document.querySelectorAll('[data-testid="expansion-panel-title"]')) as HTMLElement[];
+        const titles = Array.from(document.querySelectorAll('[data-testid="expansion-panel-title"]'));
         for (const t of titles) {
           if (!visible(t)) continue;
           const text = (t.innerText || '').trim();
           const classInvalid = t.classList.contains('emi-invalid-item');
+          // A choice-group validator (e.g. Red Lobster "Choose Side") renders a
+          // [data-testid="quantity-validator"] reading "Select one" / "Select N"
+          // and does NOT use Wawa's emi-invalid-item class or the word
+          // "required" in the title. Recognize a required group by ANY of: the
+          // invalid class, the word "required", or a "Select…" validator — but
+          // EXCLUDE anything marked Optional so we never auto-fill optional
+          // upsell sections.
+          const validatorEl = t.querySelector('[data-testid="quantity-validator"]');
+          const validatorText = (validatorEl && validatorEl.innerText || '').toLowerCase();
+          const hay = (text + ' ' + validatorText).toLowerCase();
+          const isOptional = /\boptional\b/.test(hay);
           const textRequired = /\brequired\b/i.test(text);
-          if (!classInvalid && !textRequired) continue;
+          const validatorRequired = !!validatorEl && /\bselect\b/.test(validatorText);
+          if (isOptional) continue;
+          if (!classInvalid && !textRequired && !validatorRequired) continue;
           // Skip if this section already has a selected option, regardless
           // of how Wawa marks it. We're looking for *unfilled* required.
           // Scope to the whole expansion section (tab + lazy content region),
@@ -406,13 +361,37 @@ async function fillRequiredModifiers(
 
     // Read this section's title text to derive its preference key.
     const sectionTitle = await invalidElement
-      .evaluate((el: Element) => {
-        const h = (el.querySelector('h5, h4, h3, [data-testid="emi-category"]') || el) as HTMLElement;
+      .evaluate((el) => {
+        const h = (el.querySelector('h5, h4, h3, [data-testid="emi-category"]') || el);
         return ((h.innerText || '').trim());
       })
       .catch(() => '');
     const categoryKey = deriveCategoryKey(sectionTitle);
     const preferredValue = categoryKey && preferences ? preferences[categoryKey] : null;
+
+    // No-progress guard: the same required section blocking us across attempts
+    // means the structured path can't drive it. Bail out after a few repeats so
+    // we don't burn ~7s/attempt × 8; the caller's CTA sweep is the fallback.
+    if (sectionTitle && sectionTitle === stuckTitle) stuckCount += 1;
+    else { stuckTitle = sectionTitle; stuckCount = 0; }
+    if (stuckCount >= 2) {
+      logger.warn({ sectionTitle, attempt }, 'fillRequiredModifiers: no progress on this required section after repeated attempts — stopping structured fill (CTA sweep will retry)');
+      // Dump the modal HTML so the unfillable section's option markup (e.g. how
+      // La Presa marks a selected "protein") is visible for adding a selector.
+      try {
+        const screenshotsDir = path.resolve(process.cwd(), 'screenshots');
+        if (!fs.existsSync(screenshotsDir)) fs.mkdirSync(screenshotsDir, { recursive: true });
+        const safe = String(sectionTitle).replace(/[^a-z0-9]+/gi, '_').slice(0, 40) || 'unknown';
+        const dumpPath = path.join(screenshotsDir, `stuck-section-${safe}.html`);
+        const html = await page.evaluate(() => {
+          const d = document.querySelector('[role="dialog"], [aria-modal="true"], .openDialog');
+          return d ? d.outerHTML : document.body.outerHTML;
+        }).catch(() => '');
+        if (html) { fs.writeFileSync(dumpPath, html, 'utf8'); logger.warn({ dumpPath, bytes: html.length, sectionTitle }, 'stuck-section modal HTML dumped'); }
+      } catch (_) { /* non-fatal */ }
+      await invalidSectionHandle?.dispose().catch(() => {});
+      break;
+    }
 
     // Walk up to find the <section class="cb-expansion-panel"> that wraps
     // BOTH the role="tab" toggle AND the lazy-mounted content region.
@@ -459,10 +438,10 @@ async function fillRequiredModifiers(
     // and wait for either aria-expanded to flip OR for submodifier buttons
     // to appear inside the panel. Up to ~2s — clicks can fire animation,
     // and the dialog repaints once contents mount.
-    await invalidElement.evaluate((el: HTMLElement) => el.scrollIntoView({ block: 'center' })).catch(() => {});
+    await invalidElement.evaluate((el) => el.scrollIntoView({ block: 'center' })).catch(() => {});
 
     const alreadyExpanded = await panelEl
-      .evaluate((root: Element) => {
+      .evaluate((root) => {
         const region = root.querySelector('[aria-expanded]');
         const expanded = region ? region.getAttribute('aria-expanded') === 'true' : true;
         const hasOptions = !!root.querySelector(
@@ -478,12 +457,12 @@ async function fillRequiredModifiers(
 
     if (!alreadyExpanded) {
       // Helper: wait briefly for the panel to mount its options.
-      async function waitForExpanded(ms: number): Promise<boolean> {
+      async function waitForExpanded(ms) {
         const dl = Date.now() + ms;
         while (Date.now() < dl) {
           if (!panelEl) return false;
           const ok = await panelEl
-            .evaluate((root: Element) => {
+            .evaluate((root) => {
               const hasOptions = !!root.querySelector(
                 '[data-testid="emi-childOptions-submodifierBtn"], .emi-submodifier-btn, ' +
                 'input[type="radio"]:not([disabled]), input[type="checkbox"]:not([disabled]), ' +
@@ -504,7 +483,7 @@ async function fillRequiredModifiers(
       // panelEl is the <section class="cb-expansion-panel">, tabEl is the
       // role="tab" child. aria-expanded lives on a sibling div of the tab.
       const preClickDiag = await panelEl
-        .evaluate((section: Element) => {
+        .evaluate((section) => {
           const tab = section.querySelector('[role="tab"]');
           const region = section.querySelector('[aria-expanded]');
           return {
@@ -538,11 +517,11 @@ async function fillRequiredModifiers(
       // for pointer events and ignore plain click().
       if (!expanded) {
         await tabEl
-          .evaluate((el: HTMLElement) => {
+          .evaluate((el) => {
             const r = el.getBoundingClientRect();
             const x = r.left + r.width / 2;
             const y = r.top + r.height / 2;
-            const opts: any = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0, pointerType: 'mouse' };
+            const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0, pointerType: 'mouse' };
             try { el.dispatchEvent(new PointerEvent('pointerdown', opts)); } catch (_) {}
             try { el.dispatchEvent(new MouseEvent('mousedown', opts)); } catch (_) {}
             try { el.dispatchEvent(new PointerEvent('pointerup', opts)); } catch (_) {}
@@ -592,7 +571,7 @@ async function fillRequiredModifiers(
           if (!fs.existsSync(screenshotsDir)) fs.mkdirSync(screenshotsDir, { recursive: true });
           const safe = String(sectionTitle).replace(/[^a-z0-9]+/gi, '_').slice(0, 40) || 'unknown';
           const dumpPath = path.join(screenshotsDir, `panel-wont-expand-${safe}.html`);
-          const html = await panelEl.evaluate((el: Element) => el.outerHTML).catch(() => '');
+          const html = await panelEl.evaluate((el) => el.outerHTML).catch(() => '');
           if (html) {
             fs.writeFileSync(dumpPath, html, 'utf8');
             logger.warn({ dumpPath, bytes: html.length, sectionTitle }, 'fillRequiredModifiers: panel would not expand after 4 strategies — HTML dumped');
@@ -607,14 +586,7 @@ async function fillRequiredModifiers(
     // with testid "emi-childOptions-submodifierBtn") is the primary widget
     // on Wawa-style menus; native inputs come second; ARIA-role widgets
     // are the last fallback.
-    interface RankedOption {
-      sel: string;
-      idx: number;
-      text: string;
-      upcharge: number;
-      selected?: boolean;
-    }
-    const ranked: RankedOption[] = await panelEl.evaluate((root: Element): RankedOption[] => {
+    const ranked = await panelEl.evaluate((root) => {
       const optionSelectors = [
         '[data-testid="emi-childOptions-submodifierBtn"]',
         '.emi-submodifier-btn',
@@ -628,7 +600,7 @@ async function fillRequiredModifiers(
         '[data-testid="quantity-input-add"]',
       ];
       for (const sel of optionSelectors) {
-        const nodes = Array.from(root.querySelectorAll(sel)) as HTMLElement[];
+        const nodes = Array.from(root.querySelectorAll(sel));
         if (!nodes.length) continue;
         const items = nodes.map((node, idx) => {
           // For span-based submodifier buttons the surcharge is inside
@@ -639,7 +611,7 @@ async function fillRequiredModifiers(
           if (!/\+\s*\$/.test(own)) {
             const container = (
               node.closest('label, [role="row"], li, [data-testid*="modifier"], [data-testid*="option"]') ||
-              node.parentElement || node) as HTMLElement;
+              node.parentElement || node);
             text = (container.innerText || '').trim();
           }
           const m = text.match(/\+\s*\$\s*(\d+(?:\.\d{1,2})?)/);
@@ -652,7 +624,7 @@ async function fillRequiredModifiers(
           const selected =
             node.classList.contains('emi-childOptions-submodifierBtn--selected') ||
             node.classList.contains('emi-submodifier-btn--selected') ||
-            (node as HTMLInputElement).checked === true ||
+            node.checked === true ||
             node.getAttribute('aria-checked') === 'true' ||
             !!optRow.querySelector('[data-testid="quantity-input-subtract"]');
           return { sel, idx, text: text.slice(0, 100), upcharge, selected };
@@ -672,13 +644,13 @@ async function fillRequiredModifiers(
     // resort), so it runs ONLY when `ranked` is empty.
     let usedCatchAll = false;
     if (!ranked.length) {
-      const generic: RankedOption[] = await panelEl.evaluate((root: Element): RankedOption[] => {
-        const visible = (el: Element) => {
+      const generic = await panelEl.evaluate((root) => {
+        const visible = (el) => {
           const r = el.getBoundingClientRect();
           const s = window.getComputedStyle(el);
           return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
         };
-        const banned = (el: Element | null) => {
+        const banned = (el) => {
           if (!el) return true;
           // Never the panel's own title/caret toggle, close, footer CTA, the
           // subtract (deselect) button, or qty input field.
@@ -686,18 +658,18 @@ async function fillRequiredModifiers(
           if (el.closest('[data-testid="cb-icon"]')) return true;
           const tid = (el.getAttribute('data-testid') || '').toLowerCase();
           if (/subtract|quantity-input-input|close|footer-cta|add-to-(bag|order)|caret/.test(tid)) return true;
-          if ((el as HTMLInputElement).disabled || el.getAttribute('aria-disabled') === 'true') return true;
+          if (el.disabled || el.getAttribute('aria-disabled') === 'true') return true;
           return !visible(el);
         };
         const candSel = 'button, [role="button"], [role="option"], [role="menuitemradio"], a[href], label, li';
-        const seenRows = new Set<Element>();
-        const picks: Array<{ sel: string; idx: number; text: string; upcharge: number }> = [];
+        const seenRows = new Set();
+        const picks = [];
         let tag = 0;
-        for (const el of Array.from(root.querySelectorAll(candSel)) as HTMLElement[]) {
+        for (const el of Array.from(root.querySelectorAll(candSel))) {
           if (banned(el)) continue;
           // Dedupe to one candidate per visual row, so we don't pick both a
           // row and a button nested inside it.
-          const row = (el.closest('li, [role="row"], [role="option"], label') || el.parentElement || el) as HTMLElement;
+          const row = (el.closest('li, [role="row"], [role="option"], label') || el.parentElement || el);
           const key = row;
           if (seenRows.has(key)) continue;
           // Require some label text — a real option has a name.
@@ -718,7 +690,7 @@ async function fillRequiredModifiers(
           ...p,
           idx: tagged.findIndex((n) => n.getAttribute('data-bot-opt') === String(p.idx)),
         }));
-      }).catch((): RankedOption[] => []);
+      }).catch(() => []);
       if (generic.length) {
         ranked.push(...generic);
         usedCatchAll = true;
@@ -738,7 +710,7 @@ async function fillRequiredModifiers(
         if (!fs.existsSync(screenshotsDir)) fs.mkdirSync(screenshotsDir, { recursive: true });
         const safeTitle = String(sectionTitle).replace(/[^a-z0-9]+/gi, '_').slice(0, 40) || 'unknown_section';
         const dumpPath = path.join(screenshotsDir, `empty-panel-${safeTitle}.html`);
-        const html = await panelEl.evaluate((el: Element) => el.outerHTML).catch(() => '');
+        const html = await panelEl.evaluate((el) => el.outerHTML).catch(() => '');
         if (html) {
           fs.writeFileSync(dumpPath, html, 'utf8');
           logger.warn({ attempt, sectionTitle, dumpPath, bytes: html.length }, 'fillRequiredModifiers: panel matched as required but 0 options scored — HTML dumped, share the option-row markup to add a selector');
@@ -746,7 +718,7 @@ async function fillRequiredModifiers(
       } catch (_) { /* dump failure is non-fatal */ }
     }
 
-    let picked: { sel: string; idx?: number; text?: string; upcharge?: number; selected?: boolean } | null = null;
+    let picked = null;
 
     // How many options this section requires ("Select 2 (Required)" → 2) and
     // how many are already chosen, so this pass clicks exactly the remaining
@@ -766,7 +738,7 @@ async function fillRequiredModifiers(
     // If notes carry a preference for this section (e.g. bread=White Bread),
     // pick the option whose text contains that value — case-insensitive,
     // word-boundary match so "Wheat" doesn't accidentally match "Classic Wheat".
-    let preferenceHit: RankedOption | null | undefined = null;
+    let preferenceHit = null;
     if (preferredValue && available.length) {
       const needle = String(preferredValue).toLowerCase().trim();
       const wordRe = new RegExp('\\b' + needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i');
@@ -776,7 +748,7 @@ async function fillRequiredModifiers(
 
     // Build this pass's click list: the preference first (if any), then the
     // cheapest remaining options, up to `needed`, with no duplicates.
-    const toClick: RankedOption[] = [];
+    const toClick = [];
     if (preferenceHit) toClick.push(preferenceHit);
     for (const opt of available) {
       if (toClick.length >= needed) break;
@@ -786,16 +758,44 @@ async function fillRequiredModifiers(
 
     for (const choice of toClick) {
       try {
-        // Click the nth matching option inside this panel. Done in-page so
-        // we don't depend on the panel staying stable across two round-trips.
-        const clickedOk = await panelEl.evaluate((root: Element, { sel, idx }: { sel: string; idx: number }) => {
-          const nodes = Array.from(root.querySelectorAll(sel)) as HTMLElement[];
+        // Click the nth matching option inside this panel. Grubhub's Angular
+        // submodifier buttons (e.g. La Presa "Choose a protein → Chicken")
+        // IGNORE a synthetic in-page node.click() — the same reason panel
+        // expansion needs real events — so the click looked successful but the
+        // option never got selected, the section stayed "required", and the
+        // loop re-clicked (toggling it back off). Fix: tag the node and click it
+        // with a REAL Playwright click (true pointer events), then fall back to
+        // an in-page pointer-event sequence if that didn't take.
+        const tagged = await panelEl.evaluate((root, { sel, idx }) => {
+          const nodes = Array.from(root.querySelectorAll(sel));
           const node = nodes[idx];
           if (!node) return false;
           node.scrollIntoView({ block: 'center' });
-          node.click();
+          node.setAttribute('data-bot-opt-click', '1');
           return true;
         }, { sel: choice.sel, idx: choice.idx }).catch(() => false);
+        let clickedOk = false;
+        if (tagged) {
+          const optLoc = page.locator('[data-bot-opt-click]').first();
+          clickedOk = await optLoc.click({ timeout: 1500 }).then(() => true).catch(() => false);
+          if (!clickedOk) {
+            // Real-event fallback: dispatch a full pointer/mouse sequence in-page.
+            clickedOk = await page.evaluate(() => {
+              const el = document.querySelector('[data-bot-opt-click]');
+              if (!el) return false;
+              const r = el.getBoundingClientRect();
+              const o = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, button: 0, pointerType: 'mouse' };
+              try { el.dispatchEvent(new PointerEvent('pointerdown', o)); } catch (_) {}
+              try { el.dispatchEvent(new MouseEvent('mousedown', o)); } catch (_) {}
+              try { el.dispatchEvent(new PointerEvent('pointerup', o)); } catch (_) {}
+              try { el.dispatchEvent(new MouseEvent('mouseup', o)); } catch (_) {}
+              try { el.dispatchEvent(new MouseEvent('click', o)); } catch (_) {}
+              try { el.click(); } catch (_) {}
+              return true;
+            }).catch(() => false);
+          }
+          await page.evaluate(() => { const e = document.querySelector('[data-bot-opt-click]'); if (e) e.removeAttribute('data-bot-opt-click'); }).catch(() => {});
+        }
         if (clickedOk) picked = choice;
         logger.info(
           {
@@ -867,6 +867,30 @@ async function fillRequiredModifiers(
     if (sectionHandleEl) await sectionHandleEl.dispose().catch(() => {});
     await invalidSectionHandle?.dispose().catch(() => {});
     await page.waitForTimeout(280);
+
+    // Authoritative satisfaction check after a pick. Some restaurants (e.g. La
+    // Presa's "Choose a protein → Chicken" submodifier "+" tag) mark a selected
+    // option in a way the per-option selected-class check can't read — so the
+    // next iteration's invalid-section finder would re-detect this section as
+    // unfilled and re-click the option, TOGGLING THE CHOICE BACK OFF. The footer
+    // CTA is the source of truth: once it stops saying "Make required choice",
+    // every required group is satisfied — stop now.
+    if (picked) {
+      const ctaSatisfied = await page
+        .evaluate(() => {
+          const cta = document.querySelector('[data-testid="emi-footer-cta"]');
+          if (!cta) return false;
+          const r = cta.getBoundingClientRect();
+          if (!(r.width > 0 && r.height > 0)) return false;
+          const t = (cta.innerText || '').toLowerCase();
+          return !/make required choice|choose (one|a |an |your)|select (one|a |an |your)/.test(t);
+        })
+        .catch(() => false);
+      if (ctaSatisfied) {
+        logger.info({ attempt, itemName }, 'fillRequiredModifiers: footer CTA satisfied — required choices filled, stopping');
+        break;
+      }
+    }
   }
   return true;
 }
@@ -989,21 +1013,16 @@ const MENU_ITEM_CONTAINERS = [
   'article[id^="menuItem"]',
 ];
 
-function parseDollar(text: string | null | undefined): number | null {
+function parseDollar(text) {
   const m = String(text || '').match(/\$\s*(\d+(?:,\d{3})*(?:\.\d{1,2})?)/);
   return m ? parseFloat(m[1].replace(/,/g, '')) : null;
 }
 
-interface VisibleHit {
-  loc: Locator;
-  sel: string;
-}
-
 async function findFirstVisible(
-  page: Page,
-  selectors: string[],
-  { perTryMs = 600 }: { perTryMs?: number } = {},
-): Promise<VisibleHit | null> {
+  page,
+  selectors,
+  { perTryMs = 600 } = {},
+) {
   for (const sel of selectors) {
     const loc = page.locator(sel).first();
     if (await loc.isVisible({ timeout: perTryMs }).catch(() => false)) return { loc, sel };
@@ -1012,10 +1031,10 @@ async function findFirstVisible(
 }
 
 async function clickFirstVisible(
-  page: Page,
-  selectors: string[],
-  { timeout = 4000 }: { timeout?: number } = {},
-): Promise<string | null> {
+  page,
+  selectors,
+  { timeout = 4000 } = {},
+) {
   const hit = await findFirstVisible(page, selectors);
   if (!hit) return null;
   await hit.loc.click({ timeout }).catch(() => {});
@@ -1025,7 +1044,7 @@ async function clickFirstVisible(
 // Find the first non-price line in a card's innerText. Some restaurants
 // render price before the name in the card (e.g. Wawa), so taking line[0]
 // blindly would match against "$2.69" instead of the product name.
-function nameLineFromInnerText(text: string | null | undefined): string {
+function nameLineFromInnerText(text) {
   const priceOnly = /^\s*\$?\s*\d+(?:\.\d{1,2})?\s*\+?\s*$/;
   for (const raw of String(text || '').split('\n')) {
     const line = raw.trim();
@@ -1037,9 +1056,9 @@ function nameLineFromInnerText(text: string | null | undefined): string {
 }
 
 async function findMenuItemHandle(
-  page: Page,
-  matchedName: string | null | undefined,
-): Promise<ElementHandle<SVGElement | HTMLElement> | null> {
+  page,
+  matchedName,
+) {
   const target = String(matchedName || '').trim().toLowerCase();
   if (!target) return null;
 
@@ -1047,14 +1066,14 @@ async function findMenuItemHandle(
   for (const sel of MENU_ITEM_CONTAINERS) {
     const handles = await page.$$(sel).catch(() => []);
     for (const h of handles) {
-      const txt = await h.evaluate((el) => ((el as HTMLElement).innerText || '').trim()).catch(() => '');
+      const txt = await h.evaluate((el) => (el.innerText || '').trim()).catch(() => '');
       if (nameLineFromInnerText(txt) === target) return h;
     }
   }
   for (const sel of MENU_ITEM_CONTAINERS) {
     const handles = await page.$$(sel).catch(() => []);
     for (const h of handles) {
-      const txt = await h.evaluate((el) => ((el as HTMLElement).innerText || '').trim()).catch(() => '');
+      const txt = await h.evaluate((el) => (el.innerText || '').trim()).catch(() => '');
       if (nameLineFromInnerText(txt).includes(target)) return h;
     }
   }
@@ -1069,22 +1088,22 @@ async function findMenuItemHandle(
 // (fast path), then fall back to walking every category tab until the item
 // appears. Category tabs are <li data-testid="category_NAME"> in the sidebar.
 async function findMenuItemByCategoryWalk(
-  page: Page,
-  targetName: string,
-  categoryHint?: string,
-): Promise<ElementHandle<SVGElement | HTMLElement> | null> {
+  page,
+  targetName,
+  categoryHint,
+) {
   const cats = await page
     .$$eval('[data-testid^="category_"]', (els) =>
       els.map((el) => ({
         testid: el.getAttribute('data-testid'),
-        name: ((el as HTMLElement).innerText || '').trim().split('\n')[0],
+        name: (el.innerText || '').trim().split('\n')[0],
       })),
     )
-    .catch((): Array<{ testid: string | null; name: string }> => []);
+    .catch(() => []);
   if (!cats.length) return null;
 
   // Visit the hinted category first, then all others.
-  const ordered: Array<{ testid: string | null; name: string }> = [];
+  const ordered = [];
   if (categoryHint) {
     const hl = String(categoryHint).toLowerCase();
     const hit = cats.find((c) => c.name && c.name.toLowerCase() === hl);
@@ -1115,7 +1134,7 @@ async function findMenuItemByCategoryWalk(
 // Find or clear the restaurant page's search input. Returns the locator or
 // null. We re-fetch each call because some pages re-mount the input when
 // the menu re-filters.
-async function findSearchInput(page: Page): Promise<Locator | null> {
+async function findSearchInput(page) {
   for (const sel of SEARCH_INPUT_SELECTORS) {
     const loc = page.locator(sel).first();
     if (await loc.isVisible({ timeout: 250 }).catch(() => false)) return loc;
@@ -1123,7 +1142,7 @@ async function findSearchInput(page: Page): Promise<Locator | null> {
   return null;
 }
 
-async function clearSearchInput(page: Page): Promise<void> {
+async function clearSearchInput(page) {
   const loc = await findSearchInput(page);
   if (!loc) return;
   const cur = (await loc.inputValue().catch(() => '')) || '';
@@ -1137,9 +1156,9 @@ async function clearSearchInput(page: Page): Promise<void> {
 // DOM lookup. Used as a fallback for findMenuItemHandle when virtualization
 // has unmounted the card or the menu is too long to scroll.
 async function findMenuItemViaSearch(
-  page: Page,
-  name: string,
-): Promise<ElementHandle<SVGElement | HTMLElement> | null> {
+  page,
+  name,
+) {
   const search = await findSearchInput(page);
   if (!search) {
     console.log('[cart] no search input on page');
@@ -1168,15 +1187,15 @@ async function findMenuItemViaSearch(
     const surfaced = await page
       .$$eval(
         '[data-testid="restaurant-menu-item"], [data-testid^="Item-"]:not([data-testid$="-quickAdd"])',
-        (els) => els.slice(0, 8).map((el) => ((el as HTMLElement).innerText || '').split('\n').map((s) => s.trim()).filter(Boolean)[0] || ''),
+        (els) => els.slice(0, 8).map((el) => (el.innerText || '').split('\n').map((s) => s.trim()).filter(Boolean)[0] || ''),
       )
-      .catch((): string[] => []);
+      .catch(() => []);
     console.log(`[cart] search surfaced ${surfaced.length} card(s):`, JSON.stringify(surfaced));
   }
   return handle;
 }
 
-async function readCartBadgeCount(page: Page): Promise<number | null> {
+async function readCartBadgeCount(page) {
   return await page
     .evaluate(() => {
       const sels = [
@@ -1186,7 +1205,7 @@ async function readCartBadgeCount(page: Page): Promise<number | null> {
         '[aria-label*="cart" i] [class*="badge" i]',
       ];
       for (const s of sels) {
-        const el = document.querySelector(s) as HTMLElement | null;
+        const el = document.querySelector(s);
         if (el) {
           const n = parseInt((el.innerText || el.textContent || '').trim(), 10);
           if (Number.isFinite(n)) return n;
@@ -1201,14 +1220,10 @@ async function readCartBadgeCount(page: Page): Promise<number | null> {
 // button can also just mean the modal is still hydrating. So we wait for
 // the button to enable, and if it never does, look for an explicit
 // "Required" label as confirmation before declaring it a modifier issue.
-interface AddBlockerResult {
-  state: 'enabled' | 'required-unfilled' | 'no-button' | 'disabled-unknown';
-}
-
 async function diagnoseAddBlocker(
-  page: Page,
-  { maxWaitMs = 2500 }: { maxWaitMs?: number } = {},
-): Promise<AddBlockerResult> {
+  page,
+  { maxWaitMs = 2500 } = {},
+) {
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
     const hit = await findFirstVisible(page, ADD_TO_ORDER_SELECTORS, { perTryMs: 300 });
@@ -1227,7 +1242,7 @@ async function diagnoseAddBlocker(
   // looking at an unfilled modifier modal and need to fill it.
   const finalDiag = await page
     .evaluate(() => {
-      const cta = document.querySelector('[data-testid="emi-footer-cta"]') as HTMLElement | null;
+      const cta = document.querySelector('[data-testid="emi-footer-cta"]');
       if (cta) {
         const r = cta.getBoundingClientRect();
         const visible = r.width > 0 && r.height > 0;
@@ -1243,11 +1258,11 @@ async function diagnoseAddBlocker(
         const tr = t.getBoundingClientRect();
         if (tr.width < 1 || tr.height < 1) continue;
         if (t.classList.contains('emi-invalid-item')) return 'required-unfilled';
-        if (/\brequired\b/i.test((t as HTMLElement).innerText || '')) return 'required-unfilled';
+        if (/\brequired\b/i.test(t.innerText || '')) return 'required-unfilled';
       }
       return null;
     })
-    .catch((): string | null => null);
+    .catch(() => null);
   if (finalDiag === 'required-unfilled') return { state: 'required-unfilled' };
 
   const finalHit = await findFirstVisible(page, ADD_TO_ORDER_SELECTORS, { perTryMs: 300 });
@@ -1258,9 +1273,211 @@ async function diagnoseAddBlocker(
   return { state: hasRequired ? 'required-unfilled' : 'disabled-unknown' };
 }
 
-async function closeAnyModal(page: Page): Promise<void> {
+async function closeAnyModal(page) {
   if (await clickFirstVisible(page, MODAL_CLOSE_SELECTORS, { timeout: 1500 })) return;
   await page.keyboard.press('Escape').catch(() => {});
+}
+
+// Read the open modal/footer live and click the REAL add/proceed button. The
+// static ADD_TO_ORDER_SELECTORS list misses restaurants whose CTA testid drifts,
+// and Playwright's auto-wait does NOT detect Grubhub's class-based disabled
+// state (s-btn*--disabled). So we scan the dialog, score every visible button by
+// intent ("Add to bag/order/cart", a price-bearing CTA, "proceed"), reject the
+// genuinely-disabled ones, tag the winner and click it with Playwright. Returns
+// the clicked label, or null when nothing add-like is enabled.
+async function clickAddOrProceed(page, { timeout = 4000 } = {}) {
+  const tagged = await page
+    .evaluate(() => {
+      const visible = (el) => {
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+      };
+      const realDisabled = (el) => {
+        if (el.disabled) return true;
+        if (el.getAttribute('aria-disabled') === 'true') return true;
+        // Only s-btn*--disabled is a REAL disabled state on Grubhub; other
+        // --disabled BEM modifiers (emi-border-bottom--disabled, …) are cosmetic.
+        const cls = (el.className || '').toString();
+        if (/\bs-btn[\w-]*--disabled\b/.test(cls)) return true;
+        return false;
+      };
+      const scope = document.querySelector('[role="dialog"], [aria-modal="true"], .openDialog') || document;
+      const cands = Array.from(scope.querySelectorAll('button, [role="button"], [data-testid="emi-footer-cta"]'));
+      let best = null;
+      let bestScore = 0;
+      for (const el of cands) {
+        if (!visible(el) || realDisabled(el)) continue;
+        const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+        if (!t) continue;
+        // Never the things that close/cancel/deselect or re-open required choice.
+        if (/make required choice|select (one|a |an |your)|^cancel$|^close$|remove|no thanks|not now/.test(t)) continue;
+        let score = 0;
+        if (/add to (bag|order|cart)|add item|add \d|^add\b/.test(t)) score += 100;
+        if (/move to (bag|order)|update (item|order)|save/.test(t)) score += 60;
+        if (/\$\s*\d/.test(t)) score += 30;
+        if (/proceed|continue|checkout/.test(t)) score += 20;
+        const tid = (el.getAttribute('data-testid') || '').toLowerCase();
+        if (tid === 'emi-footer-cta') score += 15;
+        if (/add|cart|bag/.test(tid)) score += 10;
+        if (score > bestScore) { bestScore = score; best = el; }
+      }
+      document.querySelectorAll('[data-bot-add]').forEach((e) => e.removeAttribute('data-bot-add'));
+      if (!best) return null;
+      best.setAttribute('data-bot-add', '1');
+      return { text: (best.innerText || best.textContent || '').trim().slice(0, 60), score: bestScore };
+    })
+    .catch(() => null);
+  if (!tagged) return null;
+  const loc = page.locator('[data-bot-add]').first();
+  const ok = await loc
+    .click({ timeout })
+    .then(() => true)
+    .catch(() => false);
+  if (!ok) return null;
+  logger.info({ picked: tagged.text, score: tagged.score }, 'clickAddOrProceed: clicked add/proceed button');
+  return tagged.text || 'add';
+}
+
+// Universal required-choice resolver, independent of panel-expansion mechanics.
+// It reads the footer CTA's "Make required choice (N)" counter (falling back to
+// counting unfilled required panels), then repeatedly expands any collapsed
+// required panel and clicks the cheapest un-selected option in the dialog,
+// re-reading the counter after each click, until it reaches zero or stalls.
+// This recovers items whose modifier panels the structured filler can't drive
+// (e.g. Red Lobster Kids "Macaroni & Cheese" side).
+async function sweepRequiredByCta(page, { maxClicks = 14 } = {}) {
+  async function readNeeded() {
+    return page
+      .evaluate(() => {
+        const cta = document.querySelector('[data-testid="emi-footer-cta"]');
+        if (cta) {
+          const t = (cta.innerText || '').toLowerCase();
+          const m = t.match(/make required choice\s*\((\d+)\)/);
+          if (m) return parseInt(m[1], 10);
+          if (/required choice/.test(t)) return 1;
+        }
+        let n = 0;
+        for (const tEl of document.querySelectorAll('[data-testid="expansion-panel-title"]')) {
+          const r = tEl.getBoundingClientRect();
+          if (r.width < 1 || r.height < 1) continue;
+          const txt = tEl.innerText || '';
+          const v = tEl.querySelector('[data-testid="quantity-validator"]');
+          const vt = ((v && v.innerText) || '').toLowerCase();
+          const invalid = tEl.classList.contains('emi-invalid-item') || /\brequired\b/i.test(txt) || (!!v && /\bselect\b/.test(vt));
+          if (!invalid) continue;
+          if (/\boptional\b/i.test(txt + ' ' + vt)) continue;
+          const panel = (tEl.parentElement && tEl.parentElement.parentElement) || tEl.parentElement;
+          const chosen = panel
+            ? panel.querySelectorAll(
+                '.emi-childOptions-submodifierBtn--selected, .emi-submodifier-btn--selected, ' +
+                'input:checked, [aria-checked="true"], [data-testid="quantity-input-subtract"]',
+              ).length
+            : 0;
+          if (chosen < 1) n += 1;
+        }
+        return n;
+      })
+      .catch(() => 0);
+  }
+  let needed = await readNeeded();
+  if (!needed) return true;
+  logger.info({ needed }, 'sweepRequiredByCta: required choices outstanding — sweeping by CTA');
+  let clicks = 0;
+  let lastNeeded = needed;
+  let noProgress = 0;
+  while (needed > 0 && clicks < maxClicks) {
+    const action = await page
+      .evaluate(() => {
+        const visible = (el) => {
+          const r = el.getBoundingClientRect();
+          const s = window.getComputedStyle(el);
+          return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+        };
+        const dialog = document.querySelector('[role="dialog"], [aria-modal="true"], .openDialog') || document;
+        // Expand the first collapsed required panel so its options mount.
+        for (const tEl of dialog.querySelectorAll('[data-testid="expansion-panel-title"]')) {
+          if (!visible(tEl)) continue;
+          const txt = tEl.innerText || '';
+          const v = tEl.querySelector('[data-testid="quantity-validator"]');
+          const vt = ((v && v.innerText) || '').toLowerCase();
+          const invalid = tEl.classList.contains('emi-invalid-item') || /\brequired\b/i.test(txt) || (!!v && /\bselect\b/.test(vt));
+          if (!invalid || /\boptional\b/i.test(txt + ' ' + vt)) continue;
+          const section = (tEl.parentElement && tEl.parentElement.parentElement) || tEl.parentElement;
+          const region = section && section.querySelector('[aria-expanded]');
+          if (region && region.getAttribute('aria-expanded') !== 'true') {
+            const tab = (section && section.querySelector('[role="tab"]')) || tEl.parentElement || tEl;
+            tab.click();
+            return 'expanded';
+          }
+        }
+        // TAG the cheapest un-selected option anywhere in the dialog (the real
+        // click happens outside via Playwright — Grubhub's Angular submodifier
+        // buttons ignore a synthetic in-page click).
+        const optSel =
+          '[data-testid="emi-childOptions-submodifierBtn"], .emi-submodifier-btn, ' +
+          '[data-testid="quantity-input-add"], [role="radio"]:not([aria-disabled="true"]), ' +
+          'input[type="radio"]:not([disabled]), input[type="checkbox"]:not([disabled])';
+        const nodes = Array.from(dialog.querySelectorAll(optSel)).filter(visible);
+        const scored = nodes
+          .map((n) => {
+            const row = n.closest('[role="row"], li, label') || n;
+            const selected =
+              n.classList.contains('emi-childOptions-submodifierBtn--selected') ||
+              n.classList.contains('emi-submodifier-btn--selected') ||
+              n.checked === true ||
+              n.getAttribute('aria-checked') === 'true' ||
+              !!row.querySelector('[data-testid="quantity-input-subtract"]');
+            const text = (row.innerText || n.innerText || '').trim();
+            const m = text.match(/\+\s*\$\s*(\d+(?:\.\d{1,2})?)/);
+            return { n, selected, up: m ? parseFloat(m[1]) : 0 };
+          })
+          .filter((o) => !o.selected);
+        scored.sort((a, b) => a.up - b.up);
+        if (!scored.length) return false;
+        document.querySelectorAll('[data-bot-sweep-opt]').forEach((e) => e.removeAttribute('data-bot-sweep-opt'));
+        scored[0].n.scrollIntoView({ block: 'center' });
+        scored[0].n.setAttribute('data-bot-sweep-opt', '1');
+        return 'tagged';
+      })
+      .catch(() => false);
+    if (action === 'expanded') {
+      await page.waitForTimeout(300);
+      continue;
+    }
+    if (action !== 'tagged') break;
+    // Real Playwright click (true pointer events), with in-page pointer-event
+    // fallback — same reason the structured filler needs it.
+    const sweepLoc = page.locator('[data-bot-sweep-opt]').first();
+    let sweepClicked = await sweepLoc.click({ timeout: 1500 }).then(() => true).catch(() => false);
+    if (!sweepClicked) {
+      await page.evaluate(() => {
+        const el = document.querySelector('[data-bot-sweep-opt]');
+        if (!el) return;
+        const r = el.getBoundingClientRect();
+        const o = { bubbles: true, cancelable: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, button: 0, pointerType: 'mouse' };
+        try { el.dispatchEvent(new PointerEvent('pointerdown', o)); } catch (_) {}
+        try { el.dispatchEvent(new MouseEvent('mousedown', o)); } catch (_) {}
+        try { el.dispatchEvent(new PointerEvent('pointerup', o)); } catch (_) {}
+        try { el.dispatchEvent(new MouseEvent('mouseup', o)); } catch (_) {}
+        try { el.dispatchEvent(new MouseEvent('click', o)); } catch (_) {}
+        try { el.click(); } catch (_) {}
+      }).catch(() => {});
+    }
+    await page.evaluate(() => { const e = document.querySelector('[data-bot-sweep-opt]'); if (e) e.removeAttribute('data-bot-sweep-opt'); }).catch(() => {});
+    clicks += 1;
+    await page.waitForTimeout(350);
+    needed = await readNeeded();
+    if (needed >= lastNeeded) {
+      noProgress += 1;
+      if (noProgress >= 3) break;
+    } else {
+      noProgress = 0;
+      lastNeeded = needed;
+    }
+  }
+  logger.info({ needed, clicks }, 'sweepRequiredByCta: done');
+  return needed === 0;
 }
 
 // Count cart line items whose name matches the wanted name (case-insensitive
@@ -1272,20 +1489,20 @@ async function closeAnyModal(page: Page): Promise<void> {
 // the sidebar is visible. Callers must invoke openCart() first, then wait
 // briefly for items to mount. We re-poll for up to 1.5s in case the sidebar
 // is still animating in.
-async function countCartItemsByName(page: Page, wantedName: string | null | undefined): Promise<number> {
+async function countCartItemsByName(page, wantedName) {
   if (!wantedName) return 0;
   const deadline = Date.now() + 1500;
   let count = -1;
-  let lastDiag: unknown = null;
+  let lastDiag = null;
   while (Date.now() < deadline) {
     const result = await page
-      .evaluate((wanted): { count: number; diag: Record<string, unknown> } => {
+      .evaluate((wanted) => {
         const needle = String(wanted).toLowerCase().trim();
         if (!needle) return { count: 0, diag: { reason: 'empty-needle' } };
         // Cart line items: each has a [data-testid="cart-item-remove"]
         // button. Walk up to find the row container that holds the item
         // name + modifier summary line.
-        const removeButtons = Array.from(document.querySelectorAll('[data-testid="cart-item-remove"]')) as HTMLElement[];
+        const removeButtons = Array.from(document.querySelectorAll('[data-testid="cart-item-remove"]'));
         // No remove buttons → cart sidebar didn't mount. Always return -1
         // ("can't count"), never 0. #ghs-cart-checkout-button is the menu
         // page's sticky footer CTA and is present even when the sidebar
@@ -1302,7 +1519,7 @@ async function countCartItemsByName(page: Page, wantedName: string | null | unde
             const r = emptyPrompt.getBoundingClientRect();
             if (r.width > 0 && r.height > 0) return { count: 0, diag: { reason: 'empty-cart-prompt-visible' } };
           }
-          const body = document.querySelector('[data-testid="global-cart-body"], #global-cart, [data-testid="global-cart"]') as HTMLElement | null;
+          const body = document.querySelector('[data-testid="global-cart-body"], #global-cart, [data-testid="global-cart"]');
           if (body) {
             const text = (body.innerText || '').toLowerCase();
             // If the body has content and isn't the empty state, the add
@@ -1320,9 +1537,9 @@ async function countCartItemsByName(page: Page, wantedName: string | null | unde
         // reliable — sometimes the row is just a generic div. Cap the walk
         // at 8 levels to avoid matching the whole sidebar.
         let n = 0;
-        const rowTexts: string[] = [];
+        const rowTexts = [];
         for (const remove of removeButtons) {
-          let node: HTMLElement | null = remove;
+          let node = remove;
           let matched = false;
           let bestText = '';
           for (let depth = 0; depth < 8 && node; depth++) {
@@ -1357,17 +1574,17 @@ async function countCartItemsByName(page: Page, wantedName: string | null | unde
 // in the cart / a remove button present / the global-cart body showing it.
 // Returns { added, count } where count is best-effort (named matches, else 1).
 async function confirmItemAdded(
-  page: Page,
-  wantedName: string | null | undefined,
-  { timeoutMs = 9000 }: { timeoutMs?: number } = {},
-): Promise<{ added: boolean; count: number }> {
+  page,
+  wantedName,
+  { timeoutMs = 9000 } = {},
+) {
   const needle = String(wantedName || '').toLowerCase().trim();
   const deadline = Date.now() + timeoutMs;
-  let last: unknown = null;
+  let last = null;
   while (Date.now() < deadline) {
     const s = await page
       .evaluate((n) => {
-        const vis = (el: Element | null) => {
+        const vis = (el) => {
           if (!el) return false;
           const r = el.getBoundingClientRect();
           if (r.width < 1 || r.height < 1) return false;
@@ -1376,16 +1593,16 @@ async function confirmItemAdded(
         };
         const emptyEl = document.querySelector('[data-testid="empty-cart-prompt"]');
         const emptyVisible = vis(emptyEl);
-        const removeBtns = Array.from(document.querySelectorAll('[data-testid="cart-item-remove"]')) as HTMLElement[];
+        const removeBtns = Array.from(document.querySelectorAll('[data-testid="cart-item-remove"]'));
         let named = 0;
         for (const b of removeBtns) {
-          let node: HTMLElement | null = b;
+          let node = b;
           for (let d = 0; d < 8 && node; d++) {
             if (n && (node.innerText || '').toLowerCase().includes(n)) { named += 1; break; }
             node = node.parentElement;
           }
         }
-        const body = document.querySelector('[data-testid="global-cart-body"], [data-testid="global-cart"], #global-cart') as HTMLElement | null;
+        const body = document.querySelector('[data-testid="global-cart-body"], [data-testid="global-cart"], #global-cart');
         const bodyHasName = !!(body && n && (body.innerText || '').toLowerCase().includes(n));
         return { emptyVisible, removeCount: removeBtns.length, named, bodyHasName };
       }, needle)
@@ -1407,19 +1624,19 @@ async function confirmItemAdded(
 // Remove N cart line items whose name matches the wanted name. Used to
 // undo duplicate adds. Returns the number actually removed.
 async function removeCartItemsByName(
-  page: Page,
-  wantedName: string | null | undefined,
-  n: number,
-): Promise<number> {
+  page,
+  wantedName,
+  n,
+) {
   if (n <= 0 || !wantedName) return 0;
   let removed = 0;
   for (let i = 0; i < n; i++) {
     const clicked = await page
       .evaluate((wanted) => {
         const needle = String(wanted).toLowerCase().trim();
-        const buttons = Array.from(document.querySelectorAll('[data-testid="cart-item-remove"]')) as HTMLElement[];
+        const buttons = Array.from(document.querySelectorAll('[data-testid="cart-item-remove"]'));
         for (const btn of buttons) {
-          let node: HTMLElement | null = btn;
+          let node = btn;
           for (let depth = 0; depth < 8 && node; depth++) {
             const text = (node.innerText || '').toLowerCase();
             if (text.includes(needle)) {
@@ -1447,16 +1664,10 @@ async function removeCartItemsByName(
 // CDP-attached sessions can be signed in on one tab and out on another.
 // Throws BotError so callers fail loudly instead of silently reporting
 // fake `added` successes for items that never landed in the cart.
-interface SignedInProbe {
-  signedIn: boolean;
-  signInLinks: string[];
-  hiText: string;
-}
-
-async function probeSignedIn(page: Page): Promise<SignedInProbe> {
+async function probeSignedIn(page) {
   return page
-    .evaluate((): SignedInProbe => {
-      const visible = (el: Element | null) => {
+    .evaluate(() => {
+      const visible = (el) => {
         if (!el) return false;
         const r = el.getBoundingClientRect();
         if (r.width < 1 || r.height < 1) return false;
@@ -1476,24 +1687,24 @@ async function probeSignedIn(page: Page): Promise<SignedInProbe> {
       for (const sel of positiveSelectors) {
         const el = document.querySelector(sel);
         if (el && visible(el)) {
-          const hi = document.querySelector('[data-testid="signin-name"]') as HTMLElement | null;
+          const hi = document.querySelector('[data-testid="signin-name"]');
           return { signedIn: true, signInLinks: [], hiText: hi ? (hi.innerText || '').trim() : '' };
         }
       }
       // Negative signal: a visible Sign In / Log In control whose ENTIRE label
       // is sign-in (anchored regex avoids matching "Sign in to see rewards"
       // body copy or aria text that can appear while still logged in).
-      const candidates = (Array.from(document.querySelectorAll('a, button')) as HTMLElement[])
+      const candidates = (Array.from(document.querySelectorAll('a, button')))
         .filter((el) => visible(el))
         .filter((el) => /^\s*(sign\s*in|log\s*in)\s*$/i.test(el.innerText || ''))
         .slice(0, 5)
         .map((el) => (el.innerText || '').trim().slice(0, 30));
       return { signedIn: candidates.length === 0, signInLinks: candidates, hiText: '' };
     })
-    .catch((): SignedInProbe => ({ signedIn: true, signInLinks: [], hiText: '' })); // optimistic on probe failure
+    .catch(() => ({ signedIn: true, signInLinks: [], hiText: '' })); // optimistic on probe failure
 }
 
-async function assertSignedIn(page: Page): Promise<SignedInProbe> {
+async function assertSignedIn(page) {
   let result = await probeSignedIn(page);
 
   // A single "signed-out" probe is unreliable mid-run: after heavy menu
@@ -1520,22 +1731,17 @@ async function assertSignedIn(page: Page): Promise<SignedInProbe> {
   return result;
 }
 
-interface AddItemsOptions {
-  saveScreenshot?: SaveScreenshot;
-  preferences?: Record<string, ModifierPreferences>;
-}
-
 async function addItemsToCart(
-  page: Page,
-  matchedItems: MatchedItem[],
-  { saveScreenshot, preferences }: AddItemsOptions = {},
-): Promise<AddItemsResult> {
+  page,
+  matchedItems,
+  { saveScreenshot, preferences } = {},
+) {
   // Fail loudly before doing anything if the session isn't valid. Without
   // this, every add silently no-ops and the bot reports fake successes.
   await assertSignedIn(page);
 
-  const added: AddedEntry[] = [];
-  const skipped: SkippedEntry[] = [];
+  const added = [];
+  const skipped = [];
   const beforeAll = await readCartBadgeCount(page);
   console.log('[cart] adding', matchedItems.length, 'items, badge=', beforeAll);
 
@@ -1565,7 +1771,7 @@ async function addItemsToCart(
     // pattern: button is a descendant), then the card's parent (Wawa
     // pattern: quick-add div is a sibling of the card). Absence means
     // "fall back to modal" (item probably has required modifiers).
-    async function findQuickAdd(): Promise<ElementHandle<Node> | null> {
+    async function findQuickAdd() {
       if (!handle) return null;
       const inCard = await handle.$(QUICK_ADD_SELECTOR).catch(() => null);
       if (inCard && (await inCard.isVisible().catch(() => false))) return inCard;
@@ -1606,7 +1812,7 @@ async function addItemsToCart(
       while (Date.now() < modalDeadline) {
         modalOpened = await page
           .evaluate(() => {
-            const cta = document.querySelector('[data-testid="emi-footer-cta"]') as HTMLElement | null;
+            const cta = document.querySelector('[data-testid="emi-footer-cta"]');
             if (!cta) return false;
             const r = cta.getBoundingClientRect();
             if (!(r.width > 0 && r.height > 0)) return false;
@@ -1621,7 +1827,7 @@ async function addItemsToCart(
               const tr = t.getBoundingClientRect();
               if (tr.width < 1 || tr.height < 1) continue;
               if (t.classList.contains('emi-invalid-item')) return true;
-              if (/\brequired\b/i.test((t as HTMLElement).innerText || '')) return true;
+              if (/\brequired\b/i.test(t.innerText || '')) return true;
             }
             return false;
           })
@@ -1641,12 +1847,12 @@ async function addItemsToCart(
         // matching. Capture both so we can see and adjust.
         const diag = await page
           .evaluate(() => {
-            const cta = document.querySelector('[data-testid="emi-footer-cta"]') as HTMLElement | null;
+            const cta = document.querySelector('[data-testid="emi-footer-cta"]');
             const ctaText = cta ? (cta.innerText || '').slice(0, 200) : null;
             const ctaVisible = cta
               ? (() => { const r = cta.getBoundingClientRect(); return r.width > 0 && r.height > 0; })()
               : false;
-            const titles = (Array.from(document.querySelectorAll('[data-testid="expansion-panel-title"]')) as HTMLElement[])
+            const titles = (Array.from(document.querySelectorAll('[data-testid="expansion-panel-title"]')))
               .filter((t) => { const r = t.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
               .slice(0, 5)
               .map((t) => ({
@@ -1673,7 +1879,7 @@ async function addItemsToCart(
         // Also check whether we're logged in or have a sign-in modal up.
         const authDiag = await page
           .evaluate(() => {
-            const signInLinks = (Array.from(document.querySelectorAll('a, button')) as HTMLElement[])
+            const signInLinks = (Array.from(document.querySelectorAll('a, button')))
               .filter((el) => {
                 const r = el.getBoundingClientRect();
                 if (r.width < 1 || r.height < 1) return false;
@@ -1734,7 +1940,7 @@ async function addItemsToCart(
         // the next item's checkout click.
         const lateModal = await page
           .evaluate(() => {
-            const cta = document.querySelector('[data-testid="emi-footer-cta"]') as HTMLElement | null;
+            const cta = document.querySelector('[data-testid="emi-footer-cta"]');
             if (!cta) return false;
             const r = cta.getBoundingClientRect();
             if (!(r.width > 0 && r.height > 0)) return false;
@@ -1744,7 +1950,7 @@ async function addItemsToCart(
               const tr = t.getBoundingClientRect();
               if (tr.width < 1 || tr.height < 1) continue;
               if (t.classList.contains('emi-invalid-item')) return true;
-              if (/\brequired\b/i.test((t as HTMLElement).innerText || '')) return true;
+              if (/\brequired\b/i.test(t.innerText || '')) return true;
             }
             return false;
           })
@@ -1791,7 +1997,7 @@ async function addItemsToCart(
     // panel-title, not just any emi-footer-cta (which upsells also have).
     const modalAlreadyOpen = await page
       .evaluate(() => {
-        const cta = document.querySelector('[data-testid="emi-footer-cta"]') as HTMLElement | null;
+        const cta = document.querySelector('[data-testid="emi-footer-cta"]');
         if (!cta) return false;
         const r = cta.getBoundingClientRect();
         if (!(r.width > 0 && r.height > 0)) return false;
@@ -1801,7 +2007,7 @@ async function addItemsToCart(
           const tr = t.getBoundingClientRect();
           if (tr.width < 1 || tr.height < 1) continue;
           if (t.classList.contains('emi-invalid-item')) return true;
-          if (/\brequired\b/i.test((t as HTMLElement).innerText || '')) return true;
+          if (/\brequired\b/i.test(t.innerText || '')) return true;
         }
         return false;
       })
@@ -1820,7 +2026,7 @@ async function addItemsToCart(
       // Hoagie"), but the menu may match a slightly different name — check
       // both. Case-insensitive lookup defends against capitalization drift.
       const prefMap = preferences || {};
-      let itemPrefs: ModifierPreferences | null = (item.requested ? prefMap[item.requested] : undefined) || prefMap[targetName] || null;
+      let itemPrefs = (item.requested ? prefMap[item.requested] : undefined) || prefMap[targetName] || null;
       if (!itemPrefs) {
         const wantedLower = String(item.requested || targetName).toLowerCase();
         const hitKey = Object.keys(prefMap).find((k) => k.toLowerCase() === wantedLower);
@@ -1855,12 +2061,25 @@ async function addItemsToCart(
         await page.waitForTimeout(500);
         diag = await diagnoseAddBlocker(page);
       }
+      // Universal fallback: if the structured filler couldn't satisfy every
+      // required group (panel wouldn't expand, unknown widget, pick didn't
+      // register), sweep the dialog by the footer CTA's "Make required choice
+      // (N)" counter — clicking the cheapest un-selected option until N hits
+      // zero. This is what recovers items like Red Lobster's Kids "Macaroni &
+      // Cheese" whose side panel the structured path can't drive.
       if (!filledOk || diag.state === 'required-unfilled' || diag.state === 'disabled-unknown') {
+        const swept = await sweepRequiredByCta(page);
+        if (swept) {
+          await page.waitForTimeout(400);
+          diag = await diagnoseAddBlocker(page);
+        }
+      }
+      if (diag.state === 'required-unfilled' || diag.state === 'disabled-unknown') {
         if (saveScreenshot) {
           await saveScreenshot(page, `blocked-${diag.state}-${targetName.replace(/[^a-z0-9]+/gi, '_')}`).catch(() => {});
         }
         await closeAnyModal(page);
-        console.log('[cart] skip:', targetName, '— still', diag.state, 'after auto-fill');
+        console.log('[cart] skip:', targetName, '— still', diag.state, 'after auto-fill + sweep');
         skipped.push({ name: targetName, reason: diag.state });
         continue;
       }
@@ -1874,7 +2093,11 @@ async function addItemsToCart(
       await page.waitForTimeout(180);
     }
 
-    const clickedAdd = await clickFirstVisible(page, ADD_TO_ORDER_SELECTORS, { timeout: 5000 });
+    // Click the add/proceed button. Prefer a live DOM scan (clickAddOrProceed)
+    // that reads the actual modal buttons and respects Grubhub's class-based
+    // disabled state, then fall back to the static selector list.
+    let clickedAdd = await clickAddOrProceed(page, { timeout: 5000 });
+    if (!clickedAdd) clickedAdd = await clickFirstVisible(page, ADD_TO_ORDER_SELECTORS, { timeout: 5000 });
     if (!clickedAdd) {
       if (saveScreenshot) {
         await saveScreenshot(page, `no-add-btn-${targetName.replace(/[^a-z0-9]+/gi, '_')}`).catch(() => {});
@@ -1948,7 +2171,7 @@ async function addItemsToCart(
 // Defensive sequence: (1) scroll back to the top so the cart button (in
 // the global nav header) is always reachable without auto-scroll; (2)
 // dismiss any pre-existing popup that could intercept the click; (3) click.
-async function openCart(page: Page): Promise<boolean> {
+async function openCart(page) {
   if (/\/(cart|checkout)/i.test(page.url())) return true;
   // Sidebar is "mounted" when checkout button, a remove button, or the empty-
   // cart prompt is visible. We VERIFY this rather than assuming success — a
@@ -1978,9 +2201,9 @@ async function openCart(page: Page): Promise<boolean> {
 // previous run or — critically in CDP-attach mode — from the user's
 // real Chrome session.
 async function clearCart(
-  page: Page,
-  { saveScreenshot }: { saveScreenshot?: SaveScreenshot } = {},
-): Promise<{ method: string; removed: number | null }> {
+  page,
+  { saveScreenshot } = {},
+) {
   const opened = await openCart(page);
   if (!opened) {
     logger.info('clearCart: no cart button visible — cart is empty, nothing to clear');
@@ -2018,7 +2241,7 @@ async function clearCart(
   return { method: 'iterate', removed };
 }
 
-async function readCartSubtotal(page: Page): Promise<number | null> {
+async function readCartSubtotal(page) {
   // Try to open the cart sidebar; if it isn't reachable (empty cart, or
   // already inline) just fall through and read whatever's on screen.
   await openCart(page);
@@ -2036,7 +2259,7 @@ async function readCartSubtotal(page: Page): Promise<number | null> {
   return m ? parseFloat(m[1].replace(/,/g, '')) : null;
 }
 
-async function proceedToCheckout(page: Page): Promise<string> {
+async function proceedToCheckout(page) {
   const urlBeforeAll = page.url();
   // Sweep any leftover popup before the first click.
   await dismissPopups(page);
@@ -2045,14 +2268,14 @@ async function proceedToCheckout(page: Page): Promise<string> {
   // clicks. If click 1 fires a cart-validation request that 4xx's or
   // never completes, that's why click 2 has no effect (the React onClick
   // is still in its in-flight state, debouncing further clicks).
-  const networkLog: Array<Record<string, unknown>> = [];
-  const onRequest = (req: import('playwright').Request) => {
+  const networkLog = [];
+  const onRequest = (req) => {
     const url = req.url();
     if (/checkout|cart|order/i.test(url)) {
       networkLog.push({ phase: 'request', method: req.method(), url: url.slice(0, 200) });
     }
   };
-  const onResponse = (res: import('playwright').Response) => {
+  const onResponse = (res) => {
     const url = res.url();
     if (/checkout|cart|order/i.test(url)) {
       networkLog.push({ phase: 'response', status: res.status(), url: url.slice(0, 200) });
@@ -2075,13 +2298,13 @@ async function proceedToCheckout(page: Page): Promise<string> {
     // dismissPopups, or which new checkout button to add to CHECKOUT_BTN_SELECTORS.
     const diag = await page
       .evaluate(() => {
-        const visible = (el: Element) => {
+        const visible = (el) => {
           const r = el.getBoundingClientRect();
           const s = window.getComputedStyle(el);
           return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
         };
-        const out: Array<Record<string, unknown>> = [];
-        for (const el of Array.from(document.querySelectorAll('button, [role="button"], a')) as HTMLElement[]) {
+        const out = [];
+        for (const el of Array.from(document.querySelectorAll('button, [role="button"], a'))) {
           if (!visible(el)) continue;
           const text = (el.innerText || '').trim().slice(0, 80);
           const testid = el.getAttribute('data-testid');
@@ -2118,21 +2341,21 @@ async function proceedToCheckout(page: Page): Promise<string> {
   // navigate". Dump the visible buttons + dialogs so we can see.
   const postClick1Diag = await page
     .evaluate(() => {
-      const visible = (el: Element) => {
+      const visible = (el) => {
         const r = el.getBoundingClientRect();
         const s = window.getComputedStyle(el);
         return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
       };
-      const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]')) as HTMLElement[];
+      const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]'));
       const visibleDialogs = dialogs.filter(visible).map((d) => ({
         ariaLabel: d.getAttribute('aria-label') || null,
         testid: d.getAttribute('data-testid') || null,
         textHead: (d.innerText || '').trim().slice(0, 200),
       }));
-      const checkoutBtn = document.querySelector('#ghs-cart-checkout-button') as HTMLButtonElement | null;
+      const checkoutBtn = document.querySelector('#ghs-cart-checkout-button');
       const allCheckoutCandidates = (Array.from(document.querySelectorAll(
         '#ghs-cart-checkout-button, [data-testid="checkout-btn"], button',
-      )) as HTMLButtonElement[]).filter(visible).filter((b) => /checkout|place order|continue/i.test(b.innerText || '')).slice(0, 8).map((b) => ({
+      ))).filter(visible).filter((b) => /checkout|place order|continue/i.test(b.innerText || '')).slice(0, 8).map((b) => ({
         text: (b.innerText || '').trim().slice(0, 60),
         id: b.id || null,
         testid: b.getAttribute('data-testid') || null,
@@ -2191,14 +2414,14 @@ async function proceedToCheckout(page: Page): Promise<string> {
     logger.warn('phase 5: 2nd checkout button not visible — capturing diagnostics');
     const diag = await page
       .evaluate(() => {
-        const visible = (el: Element) => {
+        const visible = (el) => {
           const r = el.getBoundingClientRect();
           const s = window.getComputedStyle(el);
           return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
         };
-        const out: Array<Record<string, unknown>> = [];
+        const out = [];
         const sels = 'button, [role="button"], [role="dialog"] *[data-testid], [aria-modal="true"] *';
-        for (const el of Array.from(document.querySelectorAll(sels)) as HTMLElement[]) {
+        for (const el of Array.from(document.querySelectorAll(sels))) {
           if (!visible(el)) continue;
           const text = (el.innerText || '').trim().slice(0, 80);
           const testid = el.getAttribute('data-testid');
@@ -2262,7 +2485,7 @@ async function proceedToCheckout(page: Page): Promise<string> {
   return finalUrl;
 }
 
-async function readCheckoutTotal(page: Page): Promise<number | null> {
+async function readCheckoutTotal(page) {
   // Only attempt to read the checkout total when we're actually on the
   // checkout page. Otherwise random "$X" amounts on the restaurant page
   // (delivery minimums, free-delivery thresholds, upsell carousels) get
@@ -2306,19 +2529,11 @@ async function readCheckoutTotal(page: Page): Promise<number | null> {
 // checkout-page form. Each field is independently optional — if the input
 // isn't present (or already has the right value) we skip it. Returns a
 // summary of what got written.
-interface CheckoutContact {
-  firstName?: string;
-  lastName?: string;
-  phone?: string;
-  unit?: string;
-  specialInstructions?: string;
-}
-
 async function fillCheckoutContact(
-  page: Page,
-  { firstName, lastName, phone, unit, specialInstructions }: CheckoutContact = {},
-): Promise<Record<string, string>> {
-  const result: Record<string, string> = { firstName: 'skipped', lastName: 'skipped', phone: 'skipped', unit: 'skipped', specialInstructions: 'skipped' };
+  page,
+  { firstName, lastName, phone, unit, specialInstructions } = {},
+) {
+  const result = { firstName: 'skipped', lastName: 'skipped', phone: 'skipped', unit: 'skipped', specialInstructions: 'skipped' };
 
   // On the all-in-one review page, contact fields are hidden behind an
   // "Edit" button. If we have a name/phone to write and the field isn't
@@ -2340,12 +2555,12 @@ async function fillCheckoutContact(
     }
   }
 
-  async function setIfPresent(selectors: string[], value: string | undefined, key: string): Promise<void> {
+  async function setIfPresent(selectors, value, key) {
     // First, find the input. We need to know whether the field exists on
     // the page regardless of whether we have a value, so we report both
     // axes accurately ("field absent" vs "field present but no value").
-    let foundLoc: Locator | null = null;
-    let foundSel: string | null = null;
+    let foundLoc = null;
+    let foundSel = null;
     for (const sel of selectors) {
       const loc = page.locator(sel).first();
       if (await loc.isVisible({ timeout: 400 }).catch(() => false)) {
@@ -2445,16 +2660,16 @@ async function fillCheckoutContact(
 // payment method". Lands us on the payment-method page. Returns the new
 // page URL plus what got clicked.
 async function submitCheckoutGather(
-  page: Page,
-  { addressLabel = 'home' }: { addressLabel?: string } = {},
-): Promise<{ labelClicked: string | null; submitClicked: string | null; url: string; skipped?: boolean }> {
+  page,
+  { addressLabel = 'home' } = {},
+) {
   const labelSelectors = [
     `[data-testid="address-label-${addressLabel}"]`,
     '[data-testid="address-label-home"]',
     '[data-testid^="address-label-"]',
     `button:has-text("${addressLabel.charAt(0).toUpperCase() + addressLabel.slice(1)}")`,
   ];
-  let labelClicked: string | null = null;
+  let labelClicked = null;
   for (const sel of labelSelectors) {
     const loc = page.locator(sel).first();
     if (await loc.isVisible({ timeout: 800 }).catch(() => false)) {
@@ -2475,7 +2690,7 @@ async function submitCheckoutGather(
     'button:has-text("Continue to payment method")',
     'button:has-text("Continue to Payment")',
   ];
-  let submitClicked: string | null = null;
+  let submitClicked = null;
   for (const sel of submitSelectors) {
     const loc = page.locator(sel).first();
     if (await loc.isVisible({ timeout: 1500 }).catch(() => false)) {
@@ -2511,33 +2726,33 @@ async function submitCheckoutGather(
 // Used to discover selectors for the checkout fields we need to fill —
 // run it once after `proceedToCheckout`, save the output, and pick the
 // hooks for address / phone / name fill from the dump.
-async function dumpCheckoutForm(page: Page): Promise<unknown> {
+async function dumpCheckoutForm(page) {
   return await page
     .evaluate(() => {
-      const isVisible = (el: Element) => {
+      const isVisible = (el) => {
         const r = el.getBoundingClientRect();
         if (r.width < 1 || r.height < 1) return false;
         const s = window.getComputedStyle(el);
         return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
       };
       // Walk up to find an associated <label for=...> or wrapping <label>.
-      const labelFor = (el: HTMLElement) => {
+      const labelFor = (el) => {
         if (el.id) {
-          const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`) as HTMLElement | null;
+          const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
           if (lbl) return (lbl.innerText || '').trim().slice(0, 80);
         }
-        const parentLabel = el.closest('label') as HTMLElement | null;
+        const parentLabel = el.closest('label');
         if (parentLabel) return (parentLabel.innerText || '').trim().slice(0, 80);
         // Last resort: nearest preceding text within 2 levels up.
-        let p: HTMLElement | null = el.parentElement;
+        let p = el.parentElement;
         for (let depth = 0; depth < 3 && p; depth++, p = p.parentElement) {
           const t = (p.innerText || '').trim();
           if (t && t.length < 120) return t.slice(0, 80);
         }
         return '';
       };
-      const fields: Array<Record<string, unknown>> = [];
-      for (const el of Array.from(document.querySelectorAll('input, select, textarea, button')) as HTMLElement[]) {
+      const fields = [];
+      for (const el of Array.from(document.querySelectorAll('input, select, textarea, button'))) {
         if (!isVisible(el)) continue;
         const tag = el.tagName.toLowerCase();
         // Skip non-form buttons that are clearly nav/menu (no clear label).
@@ -2560,12 +2775,12 @@ async function dumpCheckoutForm(page: Page): Promise<unknown> {
     .catch((err) => ({ error: err.message, fields: [] }));
 }
 
-async function gatherCheckoutSnapshot(page: Page): Promise<unknown> {
+async function gatherCheckoutSnapshot(page) {
   return await page
     .evaluate(() => {
-      const visibleText = (sel: string) => {
-        const out: string[] = [];
-        for (const el of Array.from(document.querySelectorAll(sel)) as HTMLElement[]) {
+      const visibleText = (sel) => {
+        const out = [];
+        for (const el of Array.from(document.querySelectorAll(sel))) {
           const r = el.getBoundingClientRect();
           if (r.width < 1 || r.height < 1) continue;
           const t = (el.innerText || '').trim();
@@ -2586,7 +2801,7 @@ async function gatherCheckoutSnapshot(page: Page): Promise<unknown> {
     .catch(() => null);
 }
 
-export {
+module.exports = {
   addItemsToCart,
   openCart,
   clearCart,
@@ -2611,32 +2826,32 @@ export {
 // Returns { changed: bool, before: 'delivery'|'pickup'|null, after: 'delivery'|'pickup'|null, err?: string }.
 // Non-fatal: if the toggle isn't visible we log and continue — some restaurants
 // only support one mode and the toggle is hidden.
-interface OrderTypeResult {
-  changed: boolean;
-  before: 'delivery' | 'pickup' | null;
-  after: 'delivery' | 'pickup' | null;
-  err?: string;
-}
-
-async function ensureOrderType(page: Page, wanted: string | null | undefined): Promise<OrderTypeResult> {
+async function ensureOrderType(page, wanted) {
   const want = (wanted || '').toLowerCase();
   if (want !== 'delivery' && want !== 'pickup') {
     return { changed: false, before: null, after: null, err: `unknown wanted=${wanted}` };
   }
 
+  // The Delivery/Pickup toggle (#delivery-button / #pickup-button, role=button,
+  // aria-pressed) is rendered by the SPA a beat AFTER navigation. Checking
+  // immediately gets a false "no toggle" and the bot never switches to pickup —
+  // leaving a pickup order stuck on Delivery (and on a restaurant that doesn't
+  // deliver to the address, every add then fails). Wait for it to mount first.
+  await page.waitForSelector('#delivery-button, #pickup-button', { timeout: 8000 }).catch(() => {});
+
   const state = await page.evaluate(() => {
     const d = document.querySelector('#delivery-button');
     const p = document.querySelector('#pickup-button');
-    const pressed = (el: Element | null) => !!el && el.getAttribute('aria-pressed') === 'true';
+    const pressed = (el) => !!el && el.getAttribute('aria-pressed') === 'true';
     return {
       hasToggle: !!(d || p),
       currentDelivery: pressed(d),
       currentPickup: pressed(p),
     };
-  }).catch((): { hasToggle: boolean; currentDelivery?: boolean; currentPickup?: boolean } => ({ hasToggle: false }));
+  }).catch(() => ({ hasToggle: false }));
 
   if (!state.hasToggle) {
-    logger.warn('ensureOrderType: no delivery/pickup toggle on page — restaurant may only support one mode');
+    logger.warn('ensureOrderType: no delivery/pickup toggle on page (even after wait) — restaurant may only support one mode');
     return { changed: false, before: null, after: null, err: 'no-toggle' };
   }
 
@@ -2693,14 +2908,7 @@ async function ensureOrderType(page: Page, wanted: string | null | undefined): P
 //
 // Defined below the module.exports because Node hoists function declarations
 // (not function expressions) — the name is bound before exports evaluates.
-interface PlaceOrderResult {
-  ok: boolean;
-  error?: string;
-  grubhubOrderId?: string;
-  confirmationUrl?: string;
-}
-
-async function placeOrder(page: Page): Promise<PlaceOrderResult> {
+async function placeOrder(page) {
   const url = page.url();
   if (!/\/checkout\/[^/]+\/review/i.test(url)) {
     return { ok: false, error: `placeOrder refused: not on /checkout/.../review (url=${url})` };

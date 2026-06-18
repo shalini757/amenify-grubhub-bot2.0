@@ -1,22 +1,18 @@
-import fs from 'fs';
-import path from 'path';
-import { logger } from '../logger';
+'use strict';
 
-interface Account {
-  id: string;
-  label?: string;
-  [key: string]: any;
-}
+const fs = require('fs');
+const path = require('path');
+const { logger } = require('../logger');
 
-let _accounts: Account[] | undefined;
+let _accounts;
 
-function loadAccounts(): Account[] {
+function loadAccounts() {
   if (_accounts) return _accounts;
   const raw = process.env.GRUBHUB_ACCOUNTS_JSON;
   if (!raw) throw new Error('GRUBHUB_ACCOUNTS_JSON env var is required');
 
   const trimmed = raw.trim();
-  let json: string;
+  let json;
   if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
     json = trimmed;
   } else {
@@ -27,30 +23,30 @@ function loadAccounts(): Account[] {
     json = fs.readFileSync(abs, 'utf8');
   }
 
-  let parsed: any;
+  let parsed;
   try {
     parsed = JSON.parse(json);
   } catch (err) {
-    throw new Error(`GRUBHUB_ACCOUNTS_JSON is not valid JSON: ${(err as Error).message}`);
+    throw new Error(`GRUBHUB_ACCOUNTS_JSON is not valid JSON: ${err.message}`);
   }
 
-  const list: unknown = Array.isArray(parsed) ? parsed : parsed.accounts;
+  const list = Array.isArray(parsed) ? parsed : parsed.accounts;
   if (!Array.isArray(list) || !list.length) {
     throw new Error('GRUBHUB_ACCOUNTS_JSON must be a non-empty array of accounts');
   }
   for (const acct of list) {
     if (!acct.id) throw new Error('every account requires an "id" field');
   }
-  _accounts = list as Account[];
+  _accounts = list;
   logger.info({ count: list.length }, 'accounts loaded');
   return _accounts;
 }
 
-function listAccounts(): Array<{ id: string; label: string }> {
+function listAccounts() {
   return loadAccounts().map((a) => ({ id: a.id, label: a.label || a.id }));
 }
 
-function pickAccount(hint?: string): Account {
+function pickAccount(hint) {
   const accounts = loadAccounts();
   if (!hint || hint === 'auto') return accounts[0];
   const match = accounts.find((a) => a.id === hint || a.label === hint);
@@ -58,4 +54,4 @@ function pickAccount(hint?: string): Account {
   return match;
 }
 
-export { loadAccounts, listAccounts, pickAccount };
+module.exports = { loadAccounts, listAccounts, pickAccount };

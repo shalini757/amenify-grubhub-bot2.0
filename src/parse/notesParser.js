@@ -1,53 +1,25 @@
+'use strict';
+
 const GRUBHUB_URL_RE = /grubhub\.com\/restaurant\//i;
 
-export type OrderType = 'delivery' | 'pickup' | null;
-
-export interface ClockTime {
-  raw: string;
-  minutesFromMidnight: number;
-}
-
-export interface ItemModifiers {
-  [itemName: string]: { [key: string]: string };
-}
-
-export interface ParsedNotes {
-  provider: string;
-  store: string;
-  storeName: string;
-  orderType: OrderType;
-  orderUrl: string;
-  maxTotal: number | null;
-  items: string;
-  deliveryAddress: string;
-  bookingPhone: string;
-  residentFirstName: string;
-  residentLastName: string;
-  specialInstructions: string;
-  driverNotes: string;
-  itemModifiers: ItemModifiers;
-  targetTime: ClockTime | null;
-  isGrubhub: boolean;
-}
-
-function firstMatch(text: string, re: RegExp): string {
+function firstMatch(text, re) {
   const m = text.match(re);
-  return m && m[1] ? m[1].trim() : '';
+  return m ? m[1].trim() : '';
 }
 
 // "Chick-fil-A - Delivery Order" → { storeName: "Chick-fil-A", orderType: "delivery" }
 // "Chick-fil-A - Pickup Order"   → { storeName: "Chick-fil-A", orderType: "pickup" }
 // Anything else                   → { storeName: <raw>, orderType: null }
-function splitStoreField(rawStore: string): { storeName: string; orderType: OrderType } {
+function splitStoreField(rawStore) {
   if (!rawStore) return { storeName: '', orderType: null };
   const m = rawStore.match(/^(.*?)\s*-\s*(Delivery|Pickup)\s+Order\s*$/i);
   if (!m) return { storeName: rawStore.trim(), orderType: null };
-  return { storeName: m[1].trim(), orderType: m[2].toLowerCase() as OrderType };
+  return { storeName: m[1].trim(), orderType: m[2].toLowerCase() };
 }
 
 // Scan free text for a clock time like "7:30 PM" / "7pm" / "11:45am".
 // AM/PM is required so we don't accidentally match prices or phone digits.
-function parseClockTime(text: string | null | undefined): ClockTime | null {
+function parseClockTime(text) {
   const m = String(text || '').match(/\b(\d{1,2})(?::(\d{2}))?\s*([AaPp])\.?\s*[Mm]\.?\b/);
   if (!m) return null;
   let h = parseInt(m[1], 10);
@@ -59,7 +31,7 @@ function parseClockTime(text: string | null | undefined): ClockTime | null {
   return { raw: m[0].trim(), minutesFromMidnight: h * 60 + min };
 }
 
-function parseNotes(notesText: string | null | undefined): ParsedNotes {
+function parseNotes(notesText) {
   const text = String(notesText || '').replace(/\r\n/g, '\n');
 
   const provider = firstMatch(text, /^\s*(\w+)\s+appointment/im).toLowerCase();
@@ -91,9 +63,9 @@ function parseNotes(notesText: string | null | undefined): ParsedNotes {
   let specialInstructions = '';
   const headerRe = /^\s*Resident notes and Special Instructions:\s*(.*)$/m;
   const m = text.match(headerRe);
-  if (m && m.index !== undefined) {
+  if (m) {
     const afterHeader = text.slice(m.index + m[0].length);
-    specialInstructions = ((m[1] ?? '') + '\n' + afterHeader).trim();
+    specialInstructions = (m[1] + '\n' + afterHeader).trim();
   }
 
   // Timing is opt-in: look in the special-instructions block first (that's
@@ -107,13 +79,13 @@ function parseNotes(notesText: string | null | undefined): ParsedNotes {
   // Used to drive fillRequiredModifiers — picks the option whose text
   // contains the requested value, falling back to local default if no
   // preference is given for that section.
-  const itemModifiers: ItemModifiers = {};
+  const itemModifiers = {};
   const modLineRe = /^\s*(.+?)\s+modifiers:\s*(.+?)\s*$/igm;
-  let modMatch: RegExpExecArray | null;
+  let modMatch;
   while ((modMatch = modLineRe.exec(text)) !== null) {
     const itemName = modMatch[1].trim();
     const pairs = modMatch[2].split(',').map((p) => p.trim()).filter(Boolean);
-    const mods: { [key: string]: string } = {};
+    const mods = {};
     for (const pair of pairs) {
       const eq = pair.indexOf('=');
       if (eq < 0) continue;
@@ -159,4 +131,4 @@ function parseNotes(notesText: string | null | undefined): ParsedNotes {
   };
 }
 
-export { parseNotes };
+module.exports = { parseNotes };

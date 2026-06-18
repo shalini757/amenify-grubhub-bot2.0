@@ -10,35 +10,16 @@
 // message, which both halves can derive (the waiter from chat.postMessage's
 // response, the click handler from the interactive payload's container).
 
-import { logger } from '../logger';
+const { logger } = require('../logger');
 
-interface Decision {
-  ok: boolean;
-  decision: 'approve' | 'reject' | 'timeout' | 'aborted';
-  userId?: string;
-  userName?: string;
-  addedAt?: number;
-}
+const pending = new Map(); // key -> { decision, waiters: [fn], createdAt }
 
-interface PendingEntry {
-  decision: Decision | null;
-  waiters: Array<(decision: Decision) => void>;
-  createdAt: number;
-}
-
-interface WaitForOptions {
-  timeoutMs?: number;
-  signal?: AbortSignal;
-}
-
-const pending = new Map<string, PendingEntry>(); // key -> { decision, waiters: [fn], createdAt }
-
-function makeKey(channel: string, ts: string): string {
+function makeKey(channel, ts) {
   return `${channel}:${ts}`;
 }
 
 // Mark a message as awaiting a decision. Idempotent.
-function register(channel: string, ts: string): string {
+function register(channel, ts) {
   const key = makeKey(channel, ts);
   if (!pending.has(key)) {
     pending.set(key, { decision: null, waiters: [], createdAt: Date.now() });
@@ -49,7 +30,7 @@ function register(channel: string, ts: string): string {
 // Called by the interactive route when a reviewer clicks a button. Resolves
 // any blocked waiter. Returns true if a pending entry existed and was newly
 // decided, false otherwise (unknown message, or already decided).
-function resolve(channel: string, ts: string, decision: Decision): boolean {
+function resolve(channel, ts, decision) {
   const key = makeKey(channel, ts);
   const entry = pending.get(key);
   if (!entry) {
@@ -73,7 +54,7 @@ function resolve(channel: string, ts: string, decision: Decision): boolean {
 //   { ok: true, decision: 'approve'|'reject', userId, userName, addedAt }
 //   { ok: false, decision: 'timeout' }
 //   { ok: false, decision: 'aborted' }
-function waitFor(channel: string, ts: string, { timeoutMs = 15 * 60 * 1000, signal }: WaitForOptions = {}): Promise<Decision> {
+function waitFor(channel, ts, { timeoutMs = 15 * 60 * 1000, signal } = {}) {
   const key = makeKey(channel, ts);
   register(channel, ts);
   const entry = pending.get(key);
@@ -82,9 +63,9 @@ function waitFor(channel: string, ts: string, { timeoutMs = 15 * 60 * 1000, sign
   // Already decided before we started waiting.
   if (entry.decision) return Promise.resolve(entry.decision);
 
-  return new Promise<Decision>((resolvePromise) => {
+  return new Promise((resolvePromise) => {
     let settled = false;
-    const done = (result: Decision) => {
+    const done = (result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -104,4 +85,4 @@ function waitFor(channel: string, ts: string, { timeoutMs = 15 * 60 * 1000, sign
   });
 }
 
-export { register, resolve, waitFor, makeKey };
+module.exports = { register, resolve, waitFor, makeKey };

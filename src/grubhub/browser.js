@@ -1,34 +1,9 @@
-/// <reference lib="dom" />
 'use strict';
 
-import fs from 'fs';
-import path from 'path';
-import { chromium } from 'playwright';
-import type { Page, Browser, BrowserContext, Locator, ElementHandle } from 'playwright';
-import { logger } from '../logger';
-
-interface LaunchResult {
-  browser: Browser;
-  context: BrowserContext;
-  accountId: string;
-  cdpAttached: boolean;
-}
-
-interface OrderTypeResult {
-  skipped?: boolean;
-  reason?: string;
-  ok?: boolean;
-  error?: string;
-  before?: string | null;
-  after?: string;
-}
-
-interface ClearStorageResult {
-  removed: string[];
-  kept: number;
-  localStorageKeys: number;
-  sessionStorageKeys: number;
-}
+const fs = require('fs');
+const path = require('path');
+const { chromium } = require('playwright');
+const { logger } = require('../logger');
 
 // This bot ALWAYS drives the real Chrome the human launched with
 // `npm run chrome` (attached over CDP). It never launches its own browser.
@@ -42,14 +17,13 @@ const SCREENSHOTS_DIR = path.resolve(process.cwd(), 'screenshots');
 const GRUBHUB_HOME = 'https://www.grubhub.com/';
 
 class BotError extends Error {
-  code: string;
-  constructor(code: string, message: string) {
+  constructor(code, message) {
     super(message);
     this.code = code;
   }
 }
 
-function ensureDirs(): void {
+function ensureDirs() {
   if (!fs.existsSync(SCREENSHOTS_DIR)) fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true });
 }
 
@@ -59,7 +33,7 @@ function ensureDirs(): void {
 // SCREENSHOT_MAX_FILES (default 300) remain, delete the oldest down to the cap.
 // Cheap (one readdir + stat per file) and best-effort — failures never block a run.
 let _lastPruneAt = 0;
-function pruneScreenshots(): void {
+function pruneScreenshots() {
   try {
     // Throttle: at most once per 5 min even if called on every screenshot.
     const now = Date.now();
@@ -81,7 +55,7 @@ function pruneScreenshots(): void {
 
     const cutoff = now - retentionDays * 24 * 60 * 60 * 1000;
     let removed = 0;
-    const survivors: { full: string; mtime: number }[] = [];
+    const survivors = [];
     for (const e of entries) {
       if (e.mtime && e.mtime < cutoff) {
         try { fs.unlinkSync(e.full); removed += 1; } catch (_) { /* skip */ }
@@ -107,7 +81,7 @@ function pruneScreenshots(): void {
 // Attach to the real Chrome started with `npm run chrome` (CDP). This is the
 // ONLY browser mode. Visibility (window vs headless) is decided by that Chrome
 // launch (HEADLESS_CHROME in launchChrome.js), not here.
-async function launchContext(accountId: string): Promise<LaunchResult> {
+async function launchContext(accountId) {
   ensureDirs();
 
   const cdpUrl = process.env.BROWSER_CDP_URL;
@@ -133,7 +107,7 @@ async function launchContext(accountId: string): Promise<LaunchResult> {
   return { browser, context, accountId, cdpAttached: true };
 }
 
-async function detectBlockers(page: Page): Promise<void> {
+async function detectBlockers(page) {
   const content = (await page.content()).toLowerCase();
   if (
     content.includes('captcha') ||
@@ -158,45 +132,27 @@ async function detectBlockers(page: Page): Promise<void> {
 // homepage AND on the pre-hydration shell, letting the bot proceed against a
 // signed-out page and fail every address swap. We also poll briefly so we read
 // the hydrated nav, not the shell. Returns true only if logged-in is proven.
-async function isLoggedIn(page: Page): Promise<boolean> {
-  try {
-    const deadline = Date.now() + 8000;
-    while (Date.now() < deadline) {
-      const state = await page
-        .evaluate(() => {
-          const visible = (el: Element | null): boolean => {
-            if (!el) return false;
-            const r = el.getBoundingClientRect();
-            const s = window.getComputedStyle(el);
-            return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
-          };
-          // Positive signal #1: the logged-in address pill (#position icon).
-          for (const btn of document.querySelectorAll<HTMLElement>('div[role="button"], button[role="button"]')) {
-            if (!btn.querySelector('[data-testid="tag"]')) continue;
-            const u = btn.querySelector('use');
-            const h = u && (u.getAttribute('xlink:href') || u.getAttribute('href'));
-            if (h === '#position' && visible(btn)) return 'in';
-          }
-          const txt = document.body.innerText || '';
-          // Positive signal #2: an account / sign-out control.
-          if (/\bsign out\b|your account|account settings/i.test(txt)) return 'in';
-          // Negative signal: a sign-in / log-in prompt is showing.
-          if (/\bsign in\b|\blog in\b/i.test(txt)) return 'out';
-          return null; // not determined yet — keep polling (may be hydrating)
-        })
-        .catch(() => null);
-      if (state === 'in') return true;
-      if (state === 'out') return false;
-      await page.waitForTimeout(400);
-    }
-    // No positive logged-in signal within the window → treat as signed out.
-    return false;
-  } catch {
-    return false;
-  }
+// Logged in = the account address pill (#position icon) shows up. The homepage
+// paints a signed-out shell ("Sign in", no pill) for ~1-3s before hydrating, so
+// WAIT for the pill (up to 12s) instead of reading once. Do NOT conclude
+// "signed out" the instant we see "Sign in" — that text is in the shell even
+// when the session is valid (that false-negative caused bogus SESSION_EXPIRED).
+async function isLoggedIn(page) {
+  return page
+    .waitForFunction(() => {
+      for (const btn of document.querySelectorAll('div[role="button"], button[role="button"]')) {
+        if (!btn.querySelector('[data-testid="tag"]')) continue;
+        const u = btn.querySelector('use');
+        const h = u && (u.getAttribute('xlink:href') || u.getAttribute('href'));
+        if (h === '#position') return true;
+      }
+      return false;
+    }, { timeout: 12000 })
+    .then(() => true)
+    .catch(() => false);
 }
 
-async function ensureLoggedIn({ context, accountId }: { context: BrowserContext; accountId: string }): Promise<Page> {
+async function ensureLoggedIn({ context, accountId }) {
   const page = await context.newPage();
   await page.goto(GRUBHUB_HOME, { waitUntil: 'domcontentloaded', timeout: 45000 });
   await detectBlockers(page);
@@ -232,7 +188,7 @@ async function ensureLoggedIn({ context, accountId }: { context: BrowserContext;
 //      is open and nothing else is overlaying it — skip dismiss entirely.
 //   2. Selector list is intentionally tight — only EXPLICIT popup testids
 //      and known "no thanks"-style buttons. No broad `*="close"` matching.
-async function dismissPopups(page: Page): Promise<void> {
+async function dismissPopups(page) {
   const cartButtonVisible = await page.locator('#ghs-cart-checkout-button').first()
     .isVisible({ timeout: 150 }).catch(() => false);
   if (cartButtonVisible) {
@@ -283,7 +239,7 @@ async function dismissPopups(page: Page): Promise<void> {
 // has non-standard suffixes like ", Unit: 4016" or trailing ", USA". Strip
 // those so we get a real suggestion list. Verification + saved-row matching
 // still use the original (street number is preserved either way).
-function placesNormalize(addr: string): string {
+function placesNormalize(addr) {
   return String(addr || '')
     .replace(/,\s*Unit\s*:?\s*[^,]+/gi, '')
     .replace(/,\s*Apt\s*\.?\s*:?\s*[^,]+/gi, '')
@@ -304,18 +260,18 @@ function placesNormalize(addr: string): string {
 // ("pill still shows account address"). So wait for the logged-in nav to
 // hydrate (the #position address pill) before swapping. Also resolves on an
 // out-of-range modal, which is a valid logged-in state for the swap to handle.
-async function waitForLoggedInNav(page: Page, timeoutMs = 12000): Promise<string | null> {
+async function waitForLoggedInNav(page, timeoutMs = 12000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const state = await page
       .evaluate(() => {
-        const visible = (el: Element | null): boolean => {
+        const visible = (el) => {
           if (!el) return false;
           const r = el.getBoundingClientRect();
           const s = window.getComputedStyle(el);
           return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
         };
-        const buttons = document.querySelectorAll<HTMLElement>('div[role="button"], button[role="button"]');
+        const buttons = document.querySelectorAll('div[role="button"], button[role="button"]');
         for (const btn of buttons) {
           if (!btn.querySelector('[data-testid="tag"]')) continue;
           const use = btn.querySelector('use');
@@ -333,7 +289,7 @@ async function waitForLoggedInNav(page: Page, timeoutMs = 12000): Promise<string
   return null;
 }
 
-async function setResidentAddressViaPill(page: Page, address: string): Promise<boolean> {
+async function setResidentAddressViaPill(page, address) {
   if (!address) throw new BotError('NO_ADDRESS', 'setResidentAddressViaPill called without address');
 
   const placesAddress = placesNormalize(address);
@@ -366,7 +322,7 @@ async function setResidentAddressViaPill(page: Page, address: string): Promise<b
     const firstWord = streetNumMatch[2];
     const pillText = await page
       .evaluate(() => {
-        const buttons = document.querySelectorAll<HTMLElement>('div[role="button"], button[role="button"]');
+        const buttons = document.querySelectorAll('div[role="button"], button[role="button"]');
         for (const btn of buttons) {
           const tag = btn.querySelector('[data-testid="tag"]');
           if (!tag) continue;
@@ -394,7 +350,7 @@ async function setResidentAddressViaPill(page: Page, address: string): Promise<b
   async function findAndClickPill() {
     return page
       .evaluate(() => {
-        const buttons = document.querySelectorAll<HTMLElement>('div[role="button"], button[role="button"]');
+        const buttons = document.querySelectorAll('div[role="button"], button[role="button"]');
         for (const btn of buttons) {
           // The pill has data-testid="tag" + class global-nav-dropdown__toggle-tag,
           // and a <use xlink:href="#position"> inside (location icon).
@@ -421,7 +377,7 @@ async function setResidentAddressViaPill(page: Page, address: string): Promise<b
   // which opens the same address-input dialog the pill normally opens.
   const outOfRangeSignal = await page
     .evaluate(() => {
-      const visible = (el: Element | null): boolean => {
+      const visible = (el) => {
         if (!el) return false;
         const r = el.getBoundingClientRect();
         const s = window.getComputedStyle(el);
@@ -432,7 +388,7 @@ async function setResidentAddressViaPill(page: Page, address: string): Promise<b
       const hasOutOfRange = /outside of delivery range|doesn'?t deliver to (the|your) selected address|this store doesn'?t deliver to your address/i.test(allText);
       if (!hasOutOfRange) return null;
       // Find a clickable "Change" or "Update address" / "Edit address" button.
-      const candidates = Array.from(document.querySelectorAll<HTMLElement>('button, [role="button"], a[role="button"]'));
+      const candidates = Array.from(document.querySelectorAll('button, [role="button"], a[role="button"]'));
       const targets = ['change', 'update address', 'edit address'];
       for (const t of targets) {
         for (const el of candidates) {
@@ -455,7 +411,7 @@ async function setResidentAddressViaPill(page: Page, address: string): Promise<b
     logger.warn({ snippet: outOfRangeSignal.htmlSnippet }, 'out-of-range modal detected but no Change/Update button matched — will try pill anyway');
   }
 
-  let clicked: { ok: boolean; text?: string } = { ok: false };
+  let clicked = { ok: false };
   // If we already clicked Change/Update above, the input dialog should be
   // open — skip the pill search. Otherwise look for the pill.
   if (outOfRangeSignal && outOfRangeSignal.matched) {
@@ -483,14 +439,14 @@ async function setResidentAddressViaPill(page: Page, address: string): Promise<b
   if (savedRowMatch) {
     const streetNum = savedRowMatch[1];
     const firstWord = savedRowMatch[2];
-    const savedRowClicked: { ok: boolean; text?: string } = await page
-      .evaluate(({ num, word }: { num: string; word: string }) => {
-        const visible = (el: Element): boolean => {
+    const savedRowClicked = await page
+      .evaluate(({ num, word }) => {
+        const visible = (el) => {
           const r = el.getBoundingClientRect();
           const s = window.getComputedStyle(el);
           return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
         };
-        const rows = document.querySelectorAll<HTMLElement>(
+        const rows = document.querySelectorAll(
           '.s-list-item-primary, [data-testid*="address-item"], [data-testid*="saved-address"], [role="option"]',
         );
         for (const row of rows) {
@@ -503,7 +459,7 @@ async function setResidentAddressViaPill(page: Page, address: string): Promise<b
           const hasFirstWord = new RegExp('\\b' + word + '\\b', 'i').test(t);
           if (!startsWithNum || !hasFirstWord) continue;
           // Click the row (or its nearest clickable ancestor).
-          const clickable = (row.closest<HTMLElement>('[role="option"], li, button, [role="button"]') || row);
+          const clickable = (row.closest('[role="option"], li, button, [role="button"]') || row);
           clickable.scrollIntoView({ block: 'center' });
           clickable.click();
           return { ok: true, text: t.slice(0, 80) };
@@ -554,7 +510,7 @@ async function setResidentAddressViaPill(page: Page, address: string): Promise<b
     'input[type="text"][aria-label*="address" i]',
     `input[name="searchTerm"]${EXCLUDE_MENU_SEARCH}`,
   ];
-  let inputHit: { loc: Locator; sel: string } | null = null;
+  let inputHit = null;
   const deadline = Date.now() + 4000;
   while (Date.now() < deadline && !inputHit) {
     for (const sel of inputSelectors) {
@@ -681,7 +637,7 @@ async function setResidentAddressViaPill(page: Page, address: string): Promise<b
     return { num, firstWord, zip, city };
   })();
 
-  function scoreOption(text: string): number {
+  function scoreOption(text) {
     const t = String(text || '');
     if (!t) return 0;
     let s = 0;
@@ -693,8 +649,8 @@ async function setResidentAddressViaPill(page: Page, address: string): Promise<b
   }
 
   // Collect every visible option across all selectors, dedup by text.
-  const candidates: { handle: ElementHandle<Node>; text: string; sel: string; score: number }[] = [];
-  const seenText = new Set<string>();
+  const candidates = [];
+  const seenText = new Set();
   for (const sel of optionSelectors) {
     const handles = await page.locator(sel).elementHandles().catch(() => []);
     for (const h of handles) {
@@ -715,16 +671,16 @@ async function setResidentAddressViaPill(page: Page, address: string): Promise<b
   // the input (skip distant page chrome).
   if (!candidates.length && want.num) {
     const fallback = await page
-      .evaluate((wantedNum: string) => {
-        const visible = (el: Element): boolean => {
+      .evaluate((wantedNum) => {
+        const visible = (el) => {
           const r = el.getBoundingClientRect();
           const s = window.getComputedStyle(el);
           return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
         };
-        const startsWithNum = (t: string): boolean =>
+        const startsWithNum = (t) =>
           t.startsWith(wantedNum + ' ') || t.startsWith(wantedNum + ',');
-        const out: { idx: number; text: string }[] = [];
-        for (const el of document.querySelectorAll<HTMLElement>('li, button, [role="button"], div, a')) {
+        const out = [];
+        for (const el of document.querySelectorAll('li, button, [role="button"], div, a')) {
           if (!visible(el)) continue;
           const t = (el.innerText || '').trim();
           if (!t || t.length > 200) continue;
@@ -799,7 +755,7 @@ async function setResidentAddressViaPill(page: Page, address: string): Promise<b
   // real keystroke. Wait for the Update button to be both visible AND
   // enabled; if it stays disabled, type one trailing space + backspace to
   // force the listener, then try again.
-  let updateHit: { btn: Locator; sel: string } | null = null;
+  let updateHit = null;
   const updateDeadline = Date.now() + 3000;
   while (Date.now() < updateDeadline) {
     updateHit = await findUpdateBtn();
@@ -835,13 +791,13 @@ async function setResidentAddressViaPill(page: Page, address: string): Promise<b
     } catch (_) { /* non-fatal */ }
     const diag = await page
       .evaluate(() => {
-        const visible = (el: Element): boolean => {
+        const visible = (el) => {
           const r = el.getBoundingClientRect();
           const s = window.getComputedStyle(el);
           return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
         };
-        const out: { tag: string; text: string; testid: string | null; disabled: boolean; cls: string }[] = [];
-        for (const el of document.querySelectorAll<HTMLElement>('button, [role="button"]')) {
+        const out = [];
+        for (const el of document.querySelectorAll('button, [role="button"]')) {
           if (!visible(el)) continue;
           const t = (el.innerText || '').trim();
           if (!/update|save|done|confirm|apply|submit/i.test(t)) continue;
@@ -916,7 +872,7 @@ async function setResidentAddressViaPill(page: Page, address: string): Promise<b
   // again and check it now starts with the resident's street number.
   const afterPillText = await page
     .evaluate(() => {
-      const btns = document.querySelectorAll<HTMLElement>('div[role="button"], button[role="button"]');
+      const btns = document.querySelectorAll('div[role="button"], button[role="button"]');
       for (const b of btns) {
         const useEl = b.querySelector('use');
         const href = useEl && (useEl.getAttribute('xlink:href') || useEl.getAttribute('href'));
@@ -953,14 +909,14 @@ async function setResidentAddressViaPill(page: Page, address: string): Promise<b
 // the rest of the codebase uses), this function maps to Grubhub's wire
 // format. A no-op if orderType is null/empty (don't disturb the user's
 // existing setting).
-async function setGrubhubOrderType(page: Page, orderType: string | null | undefined): Promise<OrderTypeResult> {
+async function setGrubhubOrderType(page, orderType) {
   if (!orderType) return { skipped: true, reason: 'no orderType' };
   const wire = orderType === 'pickup' ? 'pickup' : 'standard';
   await page.goto(GRUBHUB_HOME, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-  const res: OrderTypeResult = await page
-    .evaluate((wireMode: string) => {
+  const res = await page
+    .evaluate((wireMode) => {
       const KEY = 'ngStorage-cartState';
-      let parsed: Record<string, any>;
+      let parsed;
       try {
         const raw = window.localStorage.getItem(KEY);
         parsed = raw ? JSON.parse(raw) : {};
@@ -990,15 +946,15 @@ async function setGrubhubOrderType(page: Page, orderType: string | null | undefi
 // throws SESSION_EXPIRED even though the auth cookie is still valid. So we
 // remove a denylist of cart/address keys and explicitly preserve anything that
 // looks like auth/token/user/session/login.
-async function clearGrubhubStorage(page: Page): Promise<ClearStorageResult> {
+async function clearGrubhubStorage(page) {
   await page.goto(GRUBHUB_HOME, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-  const res: ClearStorageResult = await page
+  const res = await page
     .evaluate(() => {
       // Keys that carry the stale per-order state we want gone.
       const STALE_RE = /cart|address|location|delivery|recent|restaurant|logistics|ngStorage-cartState/i;
       // Keys we must never touch — they carry the login/session.
       const KEEP_RE = /auth|token|session|login|user|account|credential|jwt|oauth|perimeterx|_px/i;
-      const out: ClearStorageResult = { removed: [] as string[], kept: 0, localStorageKeys: 0, sessionStorageKeys: 0 };
+      const out = { removed: [], kept: 0, localStorageKeys: 0, sessionStorageKeys: 0 };
       try {
         const keys = Object.keys(window.localStorage);
         out.localStorageKeys = keys.length;
@@ -1029,7 +985,7 @@ async function clearGrubhubStorage(page: Page): Promise<ClearStorageResult> {
   return res;
 }
 
-async function saveScreenshot(page: Page, label: string, opts: { fullPage?: boolean } = {}): Promise<string | null> {
+async function saveScreenshot(page, label, opts = {}) {
   const { fullPage = false } = opts;
   ensureDirs();
   pruneScreenshots(); // best-effort, throttled to once/5min
@@ -1054,7 +1010,7 @@ async function saveScreenshot(page: Page, label: string, opts: { fullPage?: bool
   }
 }
 
-export {
+module.exports = {
   BotError,
   launchContext,
   ensureLoggedIn,

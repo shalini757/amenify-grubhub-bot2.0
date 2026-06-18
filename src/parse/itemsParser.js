@@ -1,13 +1,9 @@
+'use strict';
+
 // Parses the "Items:" line from notes into structured rows.
 // Input shape (from sampleNotes.txt):
 //   "Chicken Combo (3 Pcs) x 1 ($10.74), Chicken Combo (2 Pcs) x 1 ($9.60)"
 // Items can contain parens, "x" can be "x" or "×", price uses $ prefix.
-
-export interface ParsedItem {
-  name: string;
-  qty: number;
-  price: number;
-}
 
 const ITEM_RE = /(.+?)\s+[x×]\s+(\d+)\s*\(\s*\$([\d.,]+)\s*\)/gi;
 
@@ -16,7 +12,7 @@ const ITEM_RE = /(.+?)\s+[x×]\s+(\d+)\s*\(\s*\$([\d.,]+)\s*\)/gi;
 // as the more standard "&amp;" / "&#39;" / "&quot;"). Without this the
 // item name we send to Claude is something like "Bean &Amp; Cheese Taco"
 // and never matches a menu entry that reads "Bean & Cheese Taco".
-function decodeEntities(s: string): string {
+function decodeEntities(s) {
   if (!s) return s;
   return String(s)
     .replace(/&amp;/gi, '&')
@@ -29,11 +25,11 @@ function decodeEntities(s: string): string {
     .replace(/&nbsp;/gi, ' ');
 }
 
-function parseItems(itemsText: string | null | undefined): ParsedItem[] {
+function parseItems(itemsText) {
   if (!itemsText) return [];
   const decoded = decodeEntities(itemsText);
-  const out: ParsedItem[] = [];
-  let m: RegExpExecArray | null;
+  const out = [];
+  let m;
   ITEM_RE.lastIndex = 0;
   while ((m = ITEM_RE.exec(decoded)) !== null) {
     const name = m[1].trim().replace(/^[,\s]+/, '');
@@ -45,4 +41,4 @@ function parseItems(itemsText: string | null | undefined): ParsedItem[] {
   return out;
 }
 
-export { parseItems };
+module.exports = { parseItems };
