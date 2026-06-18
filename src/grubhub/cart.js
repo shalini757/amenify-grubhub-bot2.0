@@ -1055,29 +1055,47 @@ function nameLineFromInnerText(text) {
   return '';
 }
 
+// Locate the menu-item card for `matchedName`. When `expectedPrice` is given AND
+// more than one card matches the name (e.g. East Moon lists "Basil Chicken
+// Dinner" in two sections at $19.95 and ~$18.95), pick the card whose parsed
+// price is closest to expectedPrice — that disambiguates duplicates to the
+// correct (addable) copy. When expectedPrice is absent or only one card matches,
+// behaves exactly as before (returns the first match) so single-match restaurants
+// (Red Lobster, La Presa) are unaffected.
 async function findMenuItemHandle(
   page,
   matchedName,
+  expectedPrice,
 ) {
   const target = String(matchedName || '').trim().toLowerCase();
   if (!target) return null;
+  const wantPrice = (typeof expectedPrice === 'number' && Number.isFinite(expectedPrice)) ? expectedPrice : null;
+
+  // Collect all cards matching `predicate(nameLine)`, then pick the best by
+  // price when we have a target price and multiple candidates.
+  async function pickBest(predicate) {
+    const cands = [];
+    for (const sel of MENU_ITEM_CONTAINERS) {
+      const handles = await page.$$(sel).catch(() => []);
+      for (const h of handles) {
+        const txt = await h.evaluate((el) => (el.innerText || '').trim()).catch(() => '');
+        if (predicate(nameLineFromInnerText(txt))) cands.push({ h, price: parseDollar(txt) });
+      }
+    }
+    if (!cands.length) return null;
+    if (wantPrice == null || cands.length === 1) return cands[0].h;
+    const withPrice = cands.filter((c) => c.price != null);
+    if (!withPrice.length) return cands[0].h;
+    withPrice.sort((a, b) => Math.abs(a.price - wantPrice) - Math.abs(b.price - wantPrice));
+    const best = withPrice[0];
+    if (best.h !== cands[0].h) {
+      console.log(`[cart] price-disambiguated "${matchedName}" -> $${best.price} (wanted ~$${wantPrice})`);
+    }
+    return best.h;
+  }
 
   // Exact name-line match wins over substring.
-  for (const sel of MENU_ITEM_CONTAINERS) {
-    const handles = await page.$$(sel).catch(() => []);
-    for (const h of handles) {
-      const txt = await h.evaluate((el) => (el.innerText || '').trim()).catch(() => '');
-      if (nameLineFromInnerText(txt) === target) return h;
-    }
-  }
-  for (const sel of MENU_ITEM_CONTAINERS) {
-    const handles = await page.$$(sel).catch(() => []);
-    for (const h of handles) {
-      const txt = await h.evaluate((el) => (el.innerText || '').trim()).catch(() => '');
-      if (nameLineFromInnerText(txt).includes(target)) return h;
-    }
-  }
-  return null;
+  return (await pickBest((n) => n === target)) || (await pickBest((n) => n.includes(target)));
 }
 
 // Bring a menu item into the DOM by navigating the menu's CATEGORY tabs,
@@ -1091,6 +1109,7 @@ async function findMenuItemByCategoryWalk(
   page,
   targetName,
   categoryHint,
+  expectedPrice,
 ) {
   const cats = await page
     .$$eval('[data-testid^="category_"]', (els) =>
@@ -1119,7 +1138,7 @@ async function findMenuItemByCategoryWalk(
     await page.waitForTimeout(350);
     // A few short in-place scrolls so virtualized items in this category mount.
     for (let s = 0; s < 6; s++) {
-      const h = await findMenuItemHandle(page, targetName);
+      const h = await findMenuItemHandle(page, targetName, expectedPrice);
       if (h) {
         console.log(`[cart] found "${targetName}" in category "${cat.name}"`);
         return h;
@@ -1158,6 +1177,7 @@ async function clearSearchInput(page) {
 async function findMenuItemViaSearch(
   page,
   name,
+  expectedPrice,
 ) {
   const search = await findSearchInput(page);
   if (!search) {
@@ -1180,7 +1200,7 @@ async function findMenuItemViaSearch(
     .catch(() => {});
   await page.waitForTimeout(400);
   console.log('[cart] searched:', name);
-  const handle = await findMenuItemHandle(page, name);
+  const handle = await findMenuItemHandle(page, name, expectedPrice);
   if (!handle) {
     // Diagnostic: show what the filter actually surfaced, so a name mismatch
     // (vs. an empty filter / wrong container) is visible in the logs.
@@ -1750,13 +1770,17 @@ async function addItemsToCart(
     const qty = typeof item.qty === 'number' && Number.isFinite(item.qty) && item.qty > 0 ? item.qty : 1;
     const before = await readCartBadgeCount(page);
 
+    // Reset any leftover menu-search filter so the DOM locate sees the full
+    // menu (a prior item's search-relocate can leave the box filtered).
+    await clearSearchInput(page).catch(() => {});
+
     // Use the SCRAPED menu, not the live search bar. First try the item in the
     // currently-rendered DOM; if virtualization has unmounted it, navigate to
     // its category tab (using the scraped category hint, then walking all
     // categories) to re-render it. This mirrors how the scraper found it.
-    let handle = await findMenuItemHandle(page, targetName);
+    let handle = await findMenuItemHandle(page, targetName, item.matched_price);
     if (!handle) {
-      handle = await findMenuItemByCategoryWalk(page, targetName, item.category);
+      handle = await findMenuItemByCategoryWalk(page, targetName, item.category, item.matched_price);
     }
     if (!handle) {
       console.log('[cart] skip:', targetName, '— menu node not found (DOM + category walk)');
@@ -1971,21 +1995,36 @@ async function addItemsToCart(
               // the add went through; keep it rather than dropping a real add.
               console.log('[cart] could-not-verify (badge-only proof):', targetName);
               added.push({ name: targetName, qty: clicks, before, after, via: 'quickAdd', cartCount: -1 });
+              continue;
+            }
+            // Quick-add reported success but the item never landed in the cart —
+            // the located card was a wrong/duplicate copy whose "+" doesn't add
+            // (e.g. East Moon lists "Basil Chicken Dinner" in two sections).
+            // Re-locate the exact item via the in-page SEARCH and FALL THROUGH to
+            // the modal/add path with the fresh card instead of giving up.
+            logger.warn({ targetName, before, after }, '[cart] quick-add did not reflect in cart — re-locating via search, retrying via modal path');
+            await closeAnyModal(page).catch(() => {});
+            const fresh = await findMenuItemViaSearch(page, targetName, item.matched_price).catch(() => null);
+            if (fresh) {
+              handle = fresh;
+              await handle.scrollIntoViewIfNeeded().catch(() => {});
+              // do NOT continue — fall through to the card-click/modal path below
             } else {
-              logger.warn({ targetName, before, after }, '[cart] quick-add: cart never reflected the add within timeout');
               console.log('[cart] dedupe:', targetName, 'NOT in cart — recording as skipped');
               skipped.push({ name: targetName, reason: 'quick-add reported but item absent from cart' });
+              continue;
             }
           } else if (confQA.count > qty) {
             const removedQA = await removeCartItemsByName(page, targetName, confQA.count - qty);
             logger.warn({ targetName, inCart: confQA.count, qty, removedQA }, '[cart] dedupe: removed surplus copies after quick-add');
             console.log('[cart] dedupe:', targetName, 'inCart=' + confQA.count, 'wanted=' + qty, 'removed=' + removedQA);
             added.push({ name: targetName, qty: clicks, before, after, via: 'quickAdd', cartCount: confQA.count - removedQA });
+            continue;
           } else {
             console.log('[cart] verified:', targetName, 'inCart=' + confQA.count);
             added.push({ name: targetName, qty: clicks, before, after, via: 'quickAdd', cartCount: confQA.count });
+            continue;
           }
-          continue;
         }
       }
     }
@@ -2015,6 +2054,38 @@ async function addItemsToCart(
     if (!modalAlreadyOpen) {
       await handle.click({ timeout: 5000 }).catch(() => {});
       await page.waitForTimeout(1100);
+
+      // If the card click opened NEITHER a modifier modal NOR an add button,
+      // the located handle was a wrong/duplicate or stale card — the category
+      // walk name-matches across the whole menu and can grab a same-named card
+      // in the wrong section (e.g. East Moon matched "Basil Chicken Dinner" in
+      // the noodle-bowl section, which had no add affordance). Re-locate the
+      // exact item via the in-page SEARCH box (filters to the typed name) and
+      // click that fresh card.
+      const openedSomething = await page
+        .evaluate(() => {
+          const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+          const cta = document.querySelector('[data-testid="emi-footer-cta"]');
+          const addBtn = document.querySelector('[data-testid="add-to-bag-cta"], [data-testid="add-to-cart-cta"], [data-testid="addToCartButton"]');
+          const dialog = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]')).some(vis);
+          return vis(cta) || vis(addBtn) || dialog;
+        })
+        .catch(() => false);
+      if (!openedSomething) {
+        logger.warn({ targetName }, '[cart] card click opened no modal/add — re-locating via search and retrying');
+        const fresh = await findMenuItemViaSearch(page, targetName, item.matched_price).catch(() => null);
+        if (fresh) {
+          handle = fresh;
+          await handle.scrollIntoViewIfNeeded().catch(() => {});
+          const qa = await handle.$(QUICK_ADD_SELECTOR).catch(() => null);
+          if (qa && (await qa.isVisible().catch(() => false))) {
+            await qa.click({ timeout: 4000 }).catch(() => {});
+          } else {
+            await handle.click({ timeout: 5000 }).catch(() => {});
+          }
+          await page.waitForTimeout(1200);
+        }
+      }
     }
 
     let diag = await diagnoseAddBlocker(page);

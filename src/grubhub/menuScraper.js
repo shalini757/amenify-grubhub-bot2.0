@@ -93,18 +93,23 @@ async function collectVisibleItems(page, selector) {
 async function collectAllItemsByAccumulating(
   page,
   selector,
-  { maxScrolls = 40, scrollStep = 900 } = {},
+  { maxScrolls = 60 } = {},
 ) {
   const seen = new Map();
-  let stableTicks = 0;
-  let lastSize = -1;
-  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  let zeroAdds = 0;
+  await page.evaluate(() => { const e = document.scrollingElement || document.documentElement; e.scrollTo(0, 0); }).catch(() => {});
   await page.waitForTimeout(120);
 
+  // Bottom-driven: scroll by ~60% of the viewport, harvest each pass, and only
+  // stop once we're at the TRUE bottom AND a confirming pass added nothing.
+  // Early-exiting on a flat deduped count (the old stableTicks>=2) stopped on a
+  // lazy-mount gap before lower rows rendered — same virtualization bug as the
+  // category walk. maxScrolls is a safety valve, not the primary stop.
   for (let i = 0; i < maxScrolls; i++) {
     const got = await page
       .$$eval(selector, (els) => els.map((el) => (el.innerText || '').trim()))
       .catch(() => []);
+    const sizeBefore = seen.size;
     for (const text of got) {
       const item = parseFromInnerText(text);
       if (item && item.name) {
@@ -112,18 +117,30 @@ async function collectAllItemsByAccumulating(
         if (!seen.has(key)) seen.set(key, item);
       }
     }
-    if (seen.size === lastSize) {
-      stableTicks += 1;
-      // Two stable ticks is enough — virtualization is deterministic.
-      if (stableTicks >= 2) break;
-    } else {
-      stableTicks = 0;
-      lastSize = seen.size;
-    }
-    await page.evaluate((step) => window.scrollBy(0, step), scrollStep).catch(() => {});
-    await page.waitForTimeout(230);
+    const addedNow = seen.size - sizeBefore;
+    const geo = await page
+      .evaluate(() => {
+        const e = document.scrollingElement || document.documentElement;
+        return { top: e.scrollTop, ch: e.clientHeight, sh: e.scrollHeight };
+      })
+      .catch(() => null);
+    const atBottom = geo ? (geo.top + geo.ch >= geo.sh - 2) : true;
+    if (addedNow === 0) zeroAdds += 1; else zeroAdds = 0;
+    if (atBottom && zeroAdds >= 1) break;
+    const step = geo ? Math.floor(geo.ch * 0.6) : 900;
+    const prevSh = geo ? geo.sh : 0;
+    await page.evaluate((st) => {
+      const e = document.scrollingElement || document.documentElement;
+      e.scrollBy(0, st);
+    }, step).catch(() => {});
+    await page
+      .waitForFunction((prev) => {
+        const e = document.scrollingElement || document.documentElement;
+        return e.scrollHeight > prev || (e.scrollTop + e.clientHeight >= e.scrollHeight - 2);
+      }, prevSh, { timeout: 350 })
+      .catch(() => {});
   }
-  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  await page.evaluate(() => { const e = document.scrollingElement || document.documentElement; e.scrollTo(0, 0); }).catch(() => {});
   return Array.from(seen.values());
 }
 
@@ -301,28 +318,52 @@ async function scrapeMenu(page, { deep = true } = {}) {
       if (!(await tab.isVisible({ timeout: 800 }).catch(() => false))) continue;
       await tab.click({ timeout: 4000 }).catch(() => {});
       await page.waitForTimeout(300);
-      // Scroll this section, harvesting virtualized items as they mount.
-      // Early-stop once two consecutive scrolls add nothing new instead of
-      // always burning the full 8 iterations.
+      // Harvest this section by scrolling to its TRUE bottom. The old version
+      // capped at 8 short scrolls and early-exited after 2 ticks where the
+      // GLOBAL deduped size didn't grow — but a virtualized section whose lower
+      // rows (e.g. a long sushi/rolls list) haven't lazily mounted yet shows no
+      // growth for a couple of ticks and the walk stopped before "Salmon Mango
+      // Roll" ever rendered. Now: step by ~60% of the viewport, harvest each
+      // pass, and only stop once we're actually at the bottom AND a confirming
+      // pass added nothing — never before bottom. Safety cap guards runaways.
       const before = itemsByName.size;
-      let stable = 0;
-      let prevSize = itemsByName.size;
-      for (let s = 0; s < 8; s++) {
+      let zeroAdds = 0;
+      let reachedBottom = false;
+      for (let s = 0; s < 60; s++) {
         const got = await page
           .$$eval(winningSelector, (els) => els.map((el) => (el.innerText || '').trim()))
           .catch(() => []);
+        const sizeBeforeHarvest = itemsByName.size;
         for (const text of got) addText(text, cat.name);
-        if (itemsByName.size === prevSize) {
-          stable += 1;
-          if (stable >= 2) break;
-        } else {
-          stable = 0;
-          prevSize = itemsByName.size;
-        }
-        await page.evaluate(() => window.scrollBy(0, 700)).catch(() => {});
-        await page.waitForTimeout(120);
+        const addedNow = itemsByName.size - sizeBeforeHarvest;
+        const geo = await page
+          .evaluate(() => {
+            const e = document.scrollingElement || document.documentElement;
+            return { top: e.scrollTop, ch: e.clientHeight, sh: e.scrollHeight };
+          })
+          .catch(() => null);
+        const atBottom = geo ? (geo.top + geo.ch >= geo.sh - 2) : true;
+        if (atBottom) reachedBottom = true;
+        if (addedNow === 0) zeroAdds += 1; else zeroAdds = 0;
+        // Stop only at the bottom with at least one confirming empty pass.
+        if (atBottom && zeroAdds >= 1) break;
+        const step = geo ? Math.floor(geo.ch * 0.6) : 700;
+        const prevSh = geo ? geo.sh : 0;
+        await page.evaluate((st) => {
+          const e = document.scrollingElement || document.documentElement;
+          e.scrollBy(0, st);
+        }, step).catch(() => {});
+        // Condition-based settle: wait until the list grows or we hit bottom,
+        // capped so a static section doesn't stall (replaces the fixed 120ms).
+        await page
+          .waitForFunction((prev) => {
+            const e = document.scrollingElement || document.documentElement;
+            return e.scrollHeight > prev || (e.scrollTop + e.clientHeight >= e.scrollHeight - 2);
+          }, prevSh, { timeout: 350 })
+          .catch(() => {});
       }
-      logger.info({ category: cat.name, added: itemsByName.size - before }, 'category scraped');
+      await page.evaluate(() => { const e = document.scrollingElement || document.documentElement; e.scrollTo(0, 0); }).catch(() => {});
+      logger.info({ category: cat.name, added: itemsByName.size - before, reachedBottom }, 'category scraped');
     }
   } else {
     // No category tabs: it's one long virtualized list. Use the accumulating

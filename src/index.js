@@ -601,15 +601,35 @@ async function processOneOrder() {
     // (the bug that made it look like the restaurant was closed).
     if (!match.withinBudget && /no qualifying candidates|no items to match|no candidates/i.test(match.reason || '')) {
       try {
-        // First, if a schedule modal is somehow still up, clear it via preorder
-        // so the deep scrape walks an orderable menu.
+        // Confirm no schedule/preorder modal is covering the page before the
+        // deep scrape — a still-open modal makes scrapeMenu return
+        // classification:'closed' with zero items, which is indistinguishable
+        // from a real coverage miss and wrongly routes to human review.
+        const waitModalGone = () => page
+          .waitForFunction(() => !Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]'))
+            .some((d) => {
+              const r = d.getBoundingClientRect();
+              return r.width > 0 && r.height > 0 && /schedule (my )?order|select a (delivery|pickup) time/i.test(d.innerText || '');
+            }), { timeout: 4000 })
+          .catch(() => {});
         const lateModalUp = await preorderModalLoc.isVisible({ timeout: 800 }).catch(() => false);
         if (lateModalUp && allowPreorder) {
           logger.info('schedule modal still up before deep-scrape recovery — handling preorder');
           await tryPreorder(page, { saveScreenshot, targetTime: parsed.targetTime ?? undefined }).catch(() => {});
+          await waitModalGone();
         }
         logger.info({ reason: match.reason }, 'search candidates missing an item — full menu scrape + re-match (the 06-16 path)');
-        const deepMenu = await scrapeMenu(page, { deep: true });
+        let deepMenu = await scrapeMenu(page, { deep: true });
+        // If the deep scrape still saw a schedule modal (raced back / preorder
+        // click didn't take), retry preorder + scrape ONCE before giving up —
+        // a genuinely-closed restaurant will classify closed again and route to
+        // review as before.
+        if (deepMenu && deepMenu.classification === 'closed' && allowPreorder) {
+          logger.info('deep scrape saw schedule modal — retrying preorder + scrape once');
+          await tryPreorder(page, { saveScreenshot, targetTime: parsed.targetTime ?? undefined }).catch(() => {});
+          await waitModalGone();
+          deepMenu = await scrapeMenu(page, { deep: true });
+        }
         if (deepMenu && deepMenu.items && deepMenu.items.length) {
           // Merge: full menu wins, but keep any search-only hits too.
           const byName = new Map(deepMenu.items.map((it) => [it.name.toLowerCase(), it]));
@@ -631,6 +651,13 @@ async function processOneOrder() {
               withinBudget: match2.withinBudget,
               reason: match2.reason,
               macInMenu: mergedItems.filter((it) => /macaroni|mac\s*[&n]|mac and/i.test(it.name)).map((it) => `${it.name} | ${it.price != null ? '$' + it.price : 'n/a'}`),
+              // Diagnostic: for each requested item, which captured menu items
+              // share its first significant word — shows whether a missing match
+              // is a coverage gap (item absent) or a Claude ranking miss (present).
+              requestedHits: items.map((i) => {
+                const w = String(i.name).toLowerCase().split(/\s+/).filter((x) => x.length > 2)[0] || '';
+                return `${i.name} ~ [${mergedItems.filter((m) => w && m.name.toLowerCase().includes(w)).map((m) => m.name).slice(0, 6).join(', ')}]`;
+              }),
             },
             'budget-aware re-match after full menu scrape',
           );
@@ -761,6 +788,10 @@ async function processOneOrder() {
       requested: p.requested,
       matched_id: null,
       matched_name: p.matched_name,
+      // Forward the matched price so the add-locator can disambiguate items that
+      // share a name across menu sections (e.g. East Moon's "Basil Chicken
+      // Dinner" at $19.95 vs ~$18.95) and pick the correct, addable card.
+      matched_price: p.matched_price,
       confidence: p.confidence,
       qty: p.qty,
     }));
