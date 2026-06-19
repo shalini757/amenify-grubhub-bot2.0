@@ -1997,23 +1997,63 @@ async function addItemsToCart(
               added.push({ name: targetName, qty: clicks, before, after, via: 'quickAdd', cartCount: -1 });
               continue;
             }
-            // Quick-add reported success but the item never landed in the cart —
-            // the located card was a wrong/duplicate copy whose "+" doesn't add
-            // (e.g. East Moon lists "Basil Chicken Dinner" in two sections).
-            // Re-locate the exact item via the in-page SEARCH and FALL THROUGH to
-            // the modal/add path with the fresh card instead of giving up.
-            logger.warn({ targetName, before, after }, '[cart] quick-add did not reflect in cart — re-locating via search, retrying via modal path');
+            // Quick-add reported success but the item never landed in the cart.
+            // The "+" can flake (the SAME item added fine in other runs), and
+            // duplicate-named items (e.g. East Moon "Basil Chicken Dinner" in two
+            // sections) can land on a copy whose "+" no-ops. RETRY the add on a
+            // FRESH locate a couple times — re-clicking the "+", and if the card
+            // has none, clicking the card to open its modal — verifying the cart
+            // after each. Dedup removes any surplus if an earlier click silently
+            // did register. Only if all retries miss do we fall through to the
+            // modal path / skip.
+            // The "+" no-op'd. Stop trusting it: surface every copy of the item
+            // (duplicate-listed items have 2+), and for EACH copy OPEN its detail
+            // modal (click the card, not the "+") and add via the modal's
+            // Add-to-bag button — the reliable path a human uses. Verify the cart
+            // after each; stop at the first copy that actually lands.
+            logger.warn({ targetName, before, after }, '[cart] quick-add did not reflect — trying every copy via the detail modal');
+            let recovered = false;
             await closeAnyModal(page).catch(() => {});
-            const fresh = await findMenuItemViaSearch(page, targetName, item.matched_price).catch(() => null);
-            if (fresh) {
-              handle = fresh;
-              await handle.scrollIntoViewIfNeeded().catch(() => {});
-              // do NOT continue — fall through to the card-click/modal path below
-            } else {
-              console.log('[cart] dedupe:', targetName, 'NOT in cart — recording as skipped');
-              skipped.push({ name: targetName, reason: 'quick-add reported but item absent from cart' });
-              continue;
+            await clearSearchInput(page).catch(() => {});
+            await findMenuItemViaSearch(page, targetName, item.matched_price).catch(() => null);
+            const tgtLc = targetName.toLowerCase();
+            const copies = [];
+            for (const sel of MENU_ITEM_CONTAINERS) {
+              const hs = await page.$$(sel).catch(() => []);
+              for (const h of hs) {
+                const txt = await h.evaluate((el) => (el.innerText || '').trim()).catch(() => '');
+                const nl = nameLineFromInnerText(txt);
+                if (nl === tgtLc || nl.includes(tgtLc)) copies.push(h);
+              }
             }
+            logger.info({ targetName, copies: copies.length }, '[cart] add-retry: copies of item found on filtered menu');
+            for (const cp of copies) {
+              if (recovered) break;
+              await closeAnyModal(page).catch(() => {});
+              await cp.scrollIntoViewIfNeeded().catch(() => {});
+              await cp.click({ timeout: 4000 }).catch(() => {}); // open the item detail modal
+              await page.waitForTimeout(900);
+              let dC = await diagnoseAddBlocker(page);
+              if (dC.state === 'required-unfilled' || dC.state === 'disabled-unknown') {
+                await fillRequiredModifiers(page, { saveScreenshot, label: targetName.replace(/[^a-z0-9]+/gi, '_'), preferences: {}, itemName: targetName }).catch(() => {});
+                await sweepRequiredByCta(page).catch(() => {});
+              }
+              const clickedAddC = (await clickAddOrProceed(page, { timeout: 4000 })) || (await clickFirstVisible(page, ADD_TO_ORDER_SELECTORS, { timeout: 3000 }));
+              await page.waitForTimeout(1300);
+              await closeAnyModal(page).catch(() => {});
+              await openCart(page).catch(() => {});
+              const c2 = await confirmItemAdded(page, targetName);
+              if (c2.added) {
+                if (c2.count > qty) await removeCartItemsByName(page, targetName, c2.count - qty).catch(() => {});
+                console.log('[cart] verified after detail-modal add:', targetName, 'inCart=' + c2.count, 'viaAdd=' + !!clickedAddC);
+                added.push({ name: targetName, qty: clicks, before, after, via: 'detail-modal', cartCount: Math.min(c2.count, qty) });
+                recovered = true;
+              }
+            }
+            if (recovered) continue;
+            console.log('[cart] skip:', targetName, '— not in cart after trying all copies via detail modal');
+            skipped.push({ name: targetName, reason: 'item could not be added (all copies tried)' });
+            continue;
           } else if (confQA.count > qty) {
             const removedQA = await removeCartItemsByName(page, targetName, confQA.count - qty);
             logger.warn({ targetName, inCart: confQA.count, qty, removedQA }, '[cart] dedupe: removed surplus copies after quick-add');

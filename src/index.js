@@ -19,7 +19,7 @@ const {
 } = require('./grubhub/browser');
 const { parseNotes } = require('./parse/notesParser');
 const { parseItems } = require('./parse/itemsParser');
-const { scrapeMenu, searchMenuItems, tryPreorder, switchToPickup } = require('./grubhub/menuScraper');
+const { scrapeMenu, searchMenuItems, tryPreorder, switchToPickup, attachMenuApiCapture } = require('./grubhub/menuScraper');
 const cart = require('./grubhub/cart');
 
 // The notes parser exposes resident* fields; some legacy call sites also read
@@ -138,6 +138,29 @@ function preflightChromeReachable() {
       resolve({ ok: false, reason: `${err.code || err.message} connecting to ${probeUrl}` });
     });
   });
+}
+
+// Union DOM/search candidates with items captured from the menu API. API items
+// are the accurate source (structured price/category) so they win on dupes; we
+// drop API items flagged unavailable, but keep every DOM-only item (it's on the
+// rendered menu, so it's orderable).
+function mergeMenuApiItems(domItems, apiItems) {
+  const byName = new Map();
+  for (const it of (domItems || [])) {
+    if (it && it.name) byName.set(String(it.name).toLowerCase(), it);
+  }
+  for (const it of (apiItems || [])) {
+    if (!it || !it.name) continue;
+    if (it.available === false) continue;
+    const k = String(it.name).toLowerCase();
+    const existing = byName.get(k);
+    byName.set(k, {
+      name: it.name,
+      price: it.price != null ? it.price : (existing ? existing.price : null),
+      category: it.category || (existing ? existing.category : null),
+    });
+  }
+  return Array.from(byName.values());
 }
 
 async function processOneOrder() {
@@ -281,6 +304,16 @@ async function processOneOrder() {
     }
 
     page = await ensureLoggedIn(ctx);
+
+    // Passively capture the menu from Grubhub's API as the page loads/scrolls —
+    // structured items (exact name, price, category, availability) straight from
+    // the JSON the page already fetches. Robust alternative to DOM-text parsing
+    // for large virtualized menus. Merged into the match candidate set below.
+    // Gated so we can A/B it (MENU_API_CAPTURE=false disables both the listener
+    // and the merge — exactly the pre-API behavior).
+    const menuApi = (process.env.MENU_API_CAPTURE === 'false')
+      ? { getItems: () => [], size: () => 0, detach: () => {} }
+      : attachMenuApiCapture(page);
 
     // ensureLoggedIn uses a loose regex that false-positives on "Create an
     // account" links. Run the strong probe before doing anything else — if
@@ -566,6 +599,11 @@ async function processOneOrder() {
     //       preferring exact over fuzzy and high-confidence over low.
     // parsed.maxTotal is the subtotal cap; fees/tax/tip are enforced
     // separately at checkout via MAX_TOTAL_BASIS=all_in.
+    // Fold in any items captured from the menu API (structured, accurate) that
+    // the DOM/search candidate set is missing. API items are the reliable
+    // source for large virtualized menus.
+    menu.items = mergeMenuApiItems(menu.items, menuApi.getItems());
+
     // DIAGNOSTIC: dump the exact candidate set Claude will match against, so a
     // "0 candidates" result is explainable (wrong cards surfaced vs. real item
     // missing vs. confidence too low).
@@ -573,6 +611,7 @@ async function processOneOrder() {
       {
         requested: items.map((i) => i.name),
         candidateCount: (menu.items || []).length,
+        fromApi: menuApi.size(),
         candidates: (menu.items || []).map((it) => `${it.name} | ${it.price != null ? '$' + it.price : 'n/a'}`),
       },
       'MATCH INPUT — candidate set going into rankCandidates',
@@ -630,14 +669,17 @@ async function processOneOrder() {
           await waitModalGone();
           deepMenu = await scrapeMenu(page, { deep: true });
         }
-        if (deepMenu && deepMenu.items && deepMenu.items.length) {
-          // Merge: full menu wins, but keep any search-only hits too.
-          const byName = new Map(deepMenu.items.map((it) => [it.name.toLowerCase(), it]));
+        // The deep-scrape scroll mounts every category, which fires the menu API
+        // for each — so the API capture is now richest. Use it as the accurate
+        // source, merged with the deep scrape + prior search candidates.
+        const apiItems = menuApi.getItems();
+        if ((deepMenu && deepMenu.items && deepMenu.items.length) || apiItems.length) {
+          const byName = new Map(((deepMenu && deepMenu.items) || []).map((it) => [it.name.toLowerCase(), it]));
           for (const it of (menu.items || [])) {
             const k = it.name.toLowerCase();
             if (!byName.has(k)) byName.set(k, it);
           }
-          const mergedItems = Array.from(byName.values());
+          const mergedItems = mergeMenuApiItems(Array.from(byName.values()), apiItems);
           const match2 = await claudeClient.matchItemsBudgetAware({
             requestedItems: items.map((i) => ({ name: i.name, qty: i.qty })),
             menu: { items: mergedItems },

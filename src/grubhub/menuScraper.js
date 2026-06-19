@@ -1,5 +1,100 @@
 const { logger } = require('../logger');
 
+// ---- Menu via Grubhub's API (robust alternative to DOM scraping) ----
+//
+// Grubhub's web menu is virtualized: items lazily load (the `menu_items` API
+// returns small batches as you scroll). Rather than parse the rendered DOM
+// text (fragile — virtualization, layout, timing), we PASSIVELY capture those
+// API JSON responses while the page loads/scrolls and read items straight from
+// the structured payload (exact name, price in cents, category, availability).
+// attachMenuApiCapture(page) wires a response listener that accumulates items;
+// the caller scrolls (scrapeMenu deep already walks every category) and then
+// reads getItems(). No auth replication — we only listen to calls the page
+// already makes.
+
+// Pull top-level menu items out of any Grubhub API JSON. A real menu item has a
+// name, a `menu_category_id` (distinguishes it from a modifier/choice option,
+// which also has name+price but no category id), and a price object with an
+// integer `amount` in cents.
+function extractMenuItemsFromApi(j) {
+  const out = [];
+  const push = (name, cents, category, available) => {
+    if (!name) return;
+    out.push({
+      name: String(name).trim(),
+      price: cents != null ? cents / 100 : null,
+      category: category || null,
+      available: available !== false,
+    });
+  };
+  const visit = (o) => {
+    if (!o || typeof o !== 'object') return;
+    if (Array.isArray(o)) { for (const v of o) visit(v); return; }
+    // Shape A — /menu_items endpoint: name + menu_category_id + price.amount
+    // (cents). menu_category_id distinguishes a real item from a modifier
+    // option (which also has name+price but no category id).
+    const priceObj = o.price || o.delivery_price || o.pickup_price;
+    if (
+      o.name &&
+      o.menu_category_id != null &&
+      priceObj && typeof priceObj === 'object' && typeof priceObj.amount === 'number'
+    ) {
+      push(o.name, priceObj.amount, o.menu_category_name, o.available);
+    }
+    // Shape B — restaurant_gateway feed entity: item_name + item_price with a
+    // per-order-type {delivery|pickup}.value in cents. This is how the bulk of
+    // a category's items arrive as you walk category tabs.
+    if (o.item_name && o.item_price && typeof o.item_price === 'object') {
+      const p = o.item_price;
+      let cents = null;
+      for (const key of ['delivery', 'pickup']) {
+        if (p[key] && typeof p[key].value === 'number') { cents = p[key].value; break; }
+      }
+      if (cents == null && typeof p.value === 'number') cents = p.value;
+      push(o.item_name, cents, o.menu_category_name || o.category_name || null, o.available);
+    }
+    for (const k of Object.keys(o)) visit(o[k]);
+  };
+  visit(j);
+  return out;
+}
+
+// Attach a passive accumulator of menu items seen via the menu API. Returns
+// { getItems, size, detach }. Safe to attach once per page for the whole run.
+function attachMenuApiCapture(page) {
+  const byName = new Map(); // name(lower) -> { name, price, category, available }
+  const handler = (resp) => {
+    (async () => {
+      try {
+        const req = resp.request();
+        const url = req.url();
+        const rt = req.resourceType();
+        if (rt !== 'xhr' && rt !== 'fetch') return;
+        // Menu payloads come from .../menu_items, the restaurant feed, or the
+        // restaurant_gateway info endpoints. Match broadly, then let the
+        // extractor decide what's actually an item.
+        if (!/grubhub\.com/.test(url)) return;
+        if (!/\/menu_items|restaurant_gateway\/(feed|info)|\/restaurants\/\d+(\/|$|\?)/.test(url)) return;
+        const buf = await resp.body().catch(() => null);
+        if (!buf || buf.length < 200) return;
+        let j;
+        try { j = JSON.parse(buf.toString('utf8')); } catch (_) { return; }
+        for (const it of extractMenuItemsFromApi(j)) {
+          if (!it.name) continue;
+          const k = it.name.toLowerCase();
+          if (!byName.has(k)) byName.set(k, it);
+        }
+      } catch (_) { /* passive — never throw */ }
+    })().catch(() => {});
+  };
+  page.on('response', handler);
+  return {
+    getItems: () => Array.from(byName.values()),
+    size: () => byName.size,
+    detach: () => { try { page.off('response', handler); } catch (_) {} },
+  };
+}
+
 // Grubhub mangles class names, so we try several selector candidates and
 // fall back to scanning text-rich containers. The first run against a real
 // restaurant page will tell us which selector wins — update SELECTORS
@@ -817,4 +912,4 @@ async function switchToPickup(page) {
   return true;
 }
 
-module.exports = { scrapeMenu, searchMenuItems, tryPreorder, switchToPickup, SELECTORS };
+module.exports = { scrapeMenu, searchMenuItems, tryPreorder, switchToPickup, attachMenuApiCapture, extractMenuItemsFromApi, SELECTORS };

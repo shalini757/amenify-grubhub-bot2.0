@@ -316,7 +316,7 @@ async function setResidentAddressViaPill(page, address) {
   // If it already shows the resident's address, the whole type+Update
   // flow is a no-op and Grubhub will disable Update (nothing changed),
   // hanging the bot. Skip entirely.
-  const streetNumMatch = String(address).match(/^\s*(\d+)\s+([A-Za-z]+)/);
+  const streetNumMatch = String(address).match(/^\s*(\d+)(?:-\d+)?\s+([A-Za-z]+)/);
   if (streetNumMatch) {
     const streetNum = streetNumMatch[1];
     const firstWord = streetNumMatch[2];
@@ -335,7 +335,7 @@ async function setResidentAddressViaPill(page, address) {
       })
       .catch(() => '');
     if (pillText) {
-      const startsWithNum = pillText.startsWith(streetNum + ' ') || pillText.startsWith(streetNum + ',');
+      const startsWithNum = new RegExp('^' + streetNum + '[\\s,-]').test(pillText);
       const wordRe = new RegExp('\\b' + firstWord + '\\b', 'i');
       if (startsWithNum && wordRe.test(pillText)) {
         logger.info({ pillText, wantedAddress: '[REDACTED]' }, 'pill already shows resident address — skipping setResidentAddressViaPill (no-op)');
@@ -630,7 +630,10 @@ async function setResidentAddressViaPill(page, address) {
   // Falls back to first visible if no option clears the threshold.
   const want = (() => {
     const num = (String(address).match(/^\s*(\d+)/) || [])[1] || '';
-    const firstWord = (String(address).match(/^\s*\d+\s+([A-Za-z]+)/) || [])[1] || '';
+    // Allow a street-number RANGE (e.g. "5113-5337 Barthel Industrial Dr") —
+    // industrial/complex addresses use "NNNN-NNNN Street", so the first street
+    // word comes after an optional "-NNNN".
+    const firstWord = (String(address).match(/^\s*\d+(?:-\d+)?\s+([A-Za-z]+)/) || [])[1] || '';
     const zip = (String(address).match(/\b(\d{5})(?:-\d{4})?\b/) || [])[1] || '';
     const cityMatch = String(address).match(/,\s*([^,]+),\s*[A-Z]{2}/);
     const city = cityMatch ? cityMatch[1].trim() : '';
@@ -641,7 +644,9 @@ async function setResidentAddressViaPill(page, address) {
     const t = String(text || '');
     if (!t) return 0;
     let s = 0;
-    if (want.num && (t.startsWith(want.num + ' ') || t.startsWith(want.num + ','))) s += 5;
+    // Match the street number followed by space, comma, OR a range dash
+    // ("5113 ", "5113,", "5113-5337") so range addresses still score.
+    if (want.num && new RegExp('^' + want.num + '[\\s,-]').test(t)) s += 5;
     if (want.firstWord && new RegExp('\\b' + want.firstWord + '\\b', 'i').test(t)) s += 3;
     if (want.zip && t.includes(want.zip)) s += 2;
     if (want.city && new RegExp('\\b' + want.city.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i').test(t)) s += 1;
@@ -882,7 +887,10 @@ async function setResidentAddressViaPill(page, address) {
     })
     .catch(() => '');
   const wantedNum = (String(address).match(/^\s*(\d+)/) || [])[1] || '';
-  const verified = wantedNum && (afterPillText.startsWith(wantedNum + ' ') || afterPillText.startsWith(wantedNum + ','));
+  // Accept the pill starting with the street number followed by space, comma, OR
+  // a range dash — "5113-5337 Barthel Industrial Dr NE" is a successful swap, not
+  // a failure (the old check only allowed "5113 "/"5113," and false-failed it).
+  const verified = !!wantedNum && new RegExp('^' + wantedNum + '[\\s,-]').test(afterPillText);
 
   logger.info(
     { picked, updated, dismissedSave, verified, pillBefore: clicked.text, pillAfter: afterPillText.slice(0, 80) },
