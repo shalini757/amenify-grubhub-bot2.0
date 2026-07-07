@@ -836,6 +836,22 @@ async function fillRequiredModifiers(
 
     if (!picked) {
       logger.warn({ attempt }, 'fillRequiredModifiers: no option could be clicked for an invalid section');
+      // LAST-RESORT: let Claude (cheapest model) look at the modal and pick the
+      // required option when our selectors couldn't. If it clicks something,
+      // treat the section as handled and let the loop re-check.
+      const assisted = await claudeAssistedClick(
+        page,
+        `Satisfy the required choice "${sectionTitle || 'required option'}" for the item "${itemName || label || 'item'}" by clicking the cheapest sensible option.`,
+      ).catch(() => false);
+      if (assisted) {
+        logger.info({ attempt, sectionTitle }, 'fillRequiredModifiers: Claude-assisted click picked an option');
+        picked = { sel: 'claude-assist' };
+        if (tabHandleEl) await tabHandleEl.dispose().catch(() => {});
+        if (sectionHandleEl) await sectionHandleEl.dispose().catch(() => {});
+        await invalidSectionHandle?.dispose().catch(() => {});
+        await page.waitForTimeout(300);
+        continue;
+      }
       if (saveScreenshot && label) {
         await saveScreenshot(page, `modifier-stuck-${label}`).catch(() => {});
       }
@@ -1218,18 +1234,26 @@ async function findMenuItemViaSearch(
 async function readCartBadgeCount(page) {
   return await page
     .evaluate(() => {
+      const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+      // Explicit empty-cart state → count is 0 (not "unknown"). This makes the
+      // "badge bumped" add-verification work off a real 0→1 baseline.
+      const empty = document.querySelector('[data-testid="empty-cart-prompt"]');
+      if (vis(empty)) return 0;
+      // Real Grubhub header cart controls (confirmed live): the count digit is
+      // rendered inside the bag trigger / toggle button.
       const sels = [
         '[data-testid="cart-count"]',
         '[data-testid="header-cart-count"]',
+        '[data-testid="closed-cart-bag-trigger"]',
+        '[data-testid="toggleCart-bag-button"]',
         '[data-testid*="cart"] [class*="badge" i]',
         '[aria-label*="cart" i] [class*="badge" i]',
       ];
       for (const s of sels) {
         const el = document.querySelector(s);
-        if (el) {
-          const n = parseInt((el.innerText || el.textContent || '').trim(), 10);
-          if (Number.isFinite(n)) return n;
-        }
+        if (!el) continue;
+        const m = (el.innerText || el.textContent || '').match(/\d{1,3}/);
+        if (m) { const n = parseInt(m[0], 10); if (Number.isFinite(n)) return n; }
       }
       return null;
     })
@@ -1357,6 +1381,63 @@ async function clickAddOrProceed(page, { timeout = 4000 } = {}) {
   if (!ok) return null;
   logger.info({ picked: tagged.text, score: tagged.score }, 'clickAddOrProceed: clicked add/proceed button');
   return tagged.text || 'add';
+}
+
+// LAST-RESORT Claude-assisted click. When the deterministic logic can't decide
+// what to click (unfamiliar required-choice modal, ambiguous Add button), this
+// scrapes the visible clickable elements in the open dialog (or page), asks the
+// cheapest Claude model which ONE to click for `goal`, and clicks it with a real
+// Playwright click. Returns true if it clicked. Fallback-only — it runs solely at
+// stuck points, so it adds ~0 cost on normal orders.
+async function claudeAssistedClick(page, goal) {
+  const candidates = await page
+    .evaluate(() => {
+      const visible = (el) => {
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+      };
+      const realDisabled = (el) => el.disabled || el.getAttribute('aria-disabled') === 'true' || /\bs-btn[\w-]*--disabled\b/.test((el.className || '').toString());
+      const scope = document.querySelector('[role="dialog"], [aria-modal="true"], .openDialog') || document.body;
+      const sel = 'button, [role="button"], [data-testid="emi-childOptions-submodifierBtn"], .emi-submodifier-btn, ' +
+        '[data-testid="quantity-input-add"], [role="radio"], [role="option"], [data-testid="emi-footer-cta"], label';
+      document.querySelectorAll('[data-bot-cc-idx]').forEach((e) => e.removeAttribute('data-bot-cc-idx'));
+      const out = [];
+      const seen = new Set();
+      let tag = 0;
+      for (const el of Array.from(scope.querySelectorAll(sel))) {
+        if (!visible(el) || realDisabled(el)) continue;
+        const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!t) continue;
+        const key = t.slice(0, 60);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        el.setAttribute('data-bot-cc-idx', String(tag));
+        out.push(t.slice(0, 140));
+        tag += 1;
+        if (tag >= 40) break;
+      }
+      return out;
+    })
+    .catch(() => []);
+  if (!candidates.length) return false;
+  let decision;
+  try {
+    const { decideClick } = require('../claude/claudeClient');
+    decision = await decideClick({ goal, candidates });
+  } catch (e) {
+    logger.warn({ err: e.message }, 'claudeAssistedClick: decideClick threw (non-fatal)');
+    return false;
+  }
+  if (!decision || typeof decision.index !== 'number' || decision.index < 0 || decision.index >= candidates.length) {
+    logger.info({ goal, index: decision && decision.index }, 'claudeAssistedClick: Claude returned no usable choice');
+    return false;
+  }
+  logger.info({ goal, index: decision.index, choice: candidates[decision.index], reason: decision.reason }, 'claudeAssistedClick: clicking Claude-chosen element');
+  const loc = page.locator(`[data-bot-cc-idx="${decision.index}"]`).first();
+  const ok = await loc.click({ timeout: 3000 }).then(() => true).catch(() => false);
+  await page.evaluate(() => document.querySelectorAll('[data-bot-cc-idx]').forEach((e) => e.removeAttribute('data-bot-cc-idx'))).catch(() => {});
+  return ok;
 }
 
 // Universal required-choice resolver, independent of panel-expansion mechanics.
@@ -1787,7 +1868,30 @@ async function tryAddAllCopies(page, { targetName, expectedPrice, qty = 1, saveS
     await page.waitForTimeout(1300);
     await closeAnyModal(page).catch(() => {});
     await openCart(page).catch(() => {});
-    const c = await confirmItemAdded(page, targetName);
+    let c = await confirmItemAdded(page, targetName);
+
+    // CLAUDE FALLBACK (cheapest model): if the deterministic add on this copy
+    // didn't land in the cart, re-open the copy and let Claude decide what to
+    // click — first to satisfy any required choice, then to press Add. This
+    // fires on EVERY add-failure path, since all of them funnel through here.
+    if (!c.added) {
+      await closeAnyModal(page).catch(() => {});
+      await cp.scrollIntoViewIfNeeded().catch(() => {});
+      await cp.click({ timeout: 4000 }).catch(() => {});
+      await page.waitForTimeout(900);
+      const dC2 = await diagnoseAddBlocker(page);
+      if (dC2.state === 'required-unfilled' || dC2.state === 'disabled-unknown') {
+        await claudeAssistedClick(page, `Satisfy the required choice for the item "${targetName}" by clicking the cheapest sensible option.`).catch(() => {});
+        await page.waitForTimeout(400);
+      }
+      await claudeAssistedClick(page, `Click the button that adds "${targetName}" to the cart or bag (the primary Add/confirm button).`).catch(() => {});
+      await page.waitForTimeout(1300);
+      await closeAnyModal(page).catch(() => {});
+      await openCart(page).catch(() => {});
+      c = await confirmItemAdded(page, targetName);
+      if (c.added) logger.info({ targetName, inCart: c.count }, '[cart] tryAddAllCopies: added via CLAUDE-assisted click');
+    }
+
     if (c.added) {
       if (c.count > qty) await removeCartItemsByName(page, targetName, c.count - qty).catch(() => {});
       logger.info({ targetName, inCart: c.count, viaAdd: !!clicked }, '[cart] tryAddAllCopies: added via detail modal');
@@ -2240,6 +2344,21 @@ async function addItemsToCart(
         added.push({ name: targetName, qty, before, after: await readCartBadgeCount(page), via: 'detail-modal', cartCount: recM.count });
         continue;
       }
+      // LAST-RESORT: ask Claude which element is the Add/confirm button and click
+      // it, then verify the cart.
+      const assistedAdd = await claudeAssistedClick(page, `Click the button that adds "${targetName}" to the cart/bag (the primary Add or confirm button).`).catch(() => false);
+      if (assistedAdd) {
+        await page.waitForTimeout(1300);
+        await closeAnyModal(page).catch(() => {});
+        await openCart(page).catch(() => {});
+        const cA = await confirmItemAdded(page, targetName);
+        if (cA.added) {
+          if (cA.count > qty) await removeCartItemsByName(page, targetName, cA.count - qty).catch(() => {});
+          console.log('[cart] verified after Claude-assisted add:', targetName, 'inCart=' + cA.count);
+          added.push({ name: targetName, qty, before, after: await readCartBadgeCount(page), via: 'claude-assist', cartCount: Math.min(cA.count, qty) });
+          continue;
+        }
+      }
       console.log('[cart] skip:', targetName, '— add button not found (all copies tried)');
       skipped.push({ name: targetName, reason: 'add-to-order button not found' });
       continue;
@@ -2276,7 +2395,15 @@ async function addItemsToCart(
         continue;
       }
       logger.warn({ targetName, before, after }, '[cart] modal-fill: cart never reflected the add (no name match, no badge bump)');
-      console.log('[cart] verify:', targetName, 'NOT in cart after modal Add to bag — recording as skipped');
+      // Shared last-resort recovery (tries every copy via detail modal + the
+      // Claude-assisted click). Funnel this path through it too, so no add
+      // failure skips without the full recovery + Claude fallback.
+      const recMF = await tryAddAllCopies(page, { targetName, expectedPrice: item.matched_price, qty, saveScreenshot });
+      if (recMF.added) {
+        added.push({ name: targetName, qty, before, after: await readCartBadgeCount(page), via: 'recovery', cartCount: recMF.count });
+        continue;
+      }
+      console.log('[cart] verify:', targetName, 'NOT in cart after modal Add to bag + recovery — recording as skipped');
       skipped.push({ name: targetName, reason: 'modal Add to bag clicked but item absent from cart' });
       continue;
     }

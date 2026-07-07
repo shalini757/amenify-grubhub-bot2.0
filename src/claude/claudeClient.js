@@ -437,6 +437,47 @@ async function pickModifiers({
   return parsed;
 }
 
+// Last-resort "what should I click?" helper for when the deterministic DOM logic
+// can't decide (an unfamiliar required-choice modal, an ambiguous Add button,
+// etc.). Given a plain-English goal and the list of visible clickable elements
+// (their text, indexed), returns the index of the single best element to click,
+// or -1 if none fit. Uses the CHEAPEST model and NEVER throws (it's a fallback,
+// so a bad/again-failing response just yields index -1 and the caller skips).
+const DECIDE_MODEL = process.env.CLAUDE_DECIDE_MODEL || 'claude-haiku-4-5-20251001';
+async function decideClick({ goal, candidates }) {
+  if (!Array.isArray(candidates) || !candidates.length) return { index: -1, reason: 'no candidates' };
+  const list = candidates.map((c, i) => `${i}: ${String(c || '').replace(/\s+/g, ' ').trim().slice(0, 140)}`).join('\n');
+  const system =
+    'You help a food-ordering bot decide which ONE on-screen element to click to ' +
+    'accomplish a goal on a restaurant menu or item modal. ' +
+    'Reply with ONLY JSON: {"index": <number>, "reason": "<short>"}. ' +
+    'Pick the single best element by its index. If the goal is to satisfy a ' +
+    'required choice, prefer the cheapest sensible option. If the goal is to add ' +
+    'the item, pick the primary Add/confirm button. If none fit, return index -1.';
+  const user = `Goal: ${goal}\n\nClickable elements (index: text):\n${list}`;
+  try {
+    const res = await client().messages.create({
+      model: DECIDE_MODEL,
+      max_tokens: 150,
+      system,
+      messages: [{ role: 'user', content: user }],
+    });
+    logUsage('decideClick', res);
+    const text = extractText(res);
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch (_) {
+      const m = text && text.match(/\{[\s\S]*\}/);
+      if (m) { try { parsed = JSON.parse(m[0]); } catch (_) { /* give up */ } }
+    }
+    if (!parsed || typeof parsed.index !== 'number') return { index: -1, reason: 'unparseable' };
+    console.log('[claude] decideClick →', parsed.index, parsed.reason || '');
+    return { index: parsed.index, reason: parsed.reason || '' };
+  } catch (e) {
+    console.log('[claude] decideClick failed (non-fatal):', e.message);
+    return { index: -1, reason: 'error' };
+  }
+}
+
 async function parseConfirmation({ html }) {
   console.log('[claude] parseConfirmation');
   const cleaned = stripHtml(html);
@@ -518,6 +559,7 @@ module.exports = {
   solveBudget,
   matchItemsBudgetAware,
   pickModifiers,
+  decideClick,
   parseConfirmation,
   reasonAboutError,
   stripHtml,
