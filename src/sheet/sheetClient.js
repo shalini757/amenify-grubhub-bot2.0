@@ -404,6 +404,21 @@ async function getMaxDataRow() {
   return 1 + rows.length;
 }
 
+// Find one order row by its `id` (appointment_id), regardless of bot_status /
+// ready-state — the external API path locates a specific order to run rather
+// than scanning the queue. Returns the row object (with _rowNumber) or null.
+async function getOrderById(appointmentId) {
+  const header = await readHeader();
+  const res = await sheets().spreadsheets.values.get({
+    spreadsheetId: spreadsheetId(),
+    range: dataRange(),
+  });
+  const rows = res.data.values || [];
+  const objects = rowsToObjects(header, rows, 2);
+  const want = String(appointmentId).trim();
+  return objects.find((r) => String(r.id).trim() === want) || null;
+}
+
 module.exports = {
   COLUMNS,
   BOT_OWNER,
@@ -411,6 +426,7 @@ module.exports = {
   verifyConnection,
   getQueuedOrders,
   getMaxDataRow,
+  getOrderById,
   appendOrder,
   lockRow,
   unlockRow,

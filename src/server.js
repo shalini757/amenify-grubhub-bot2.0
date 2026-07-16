@@ -26,7 +26,7 @@ const { handleInteractivePayload, verifySlackSignature } = require('./review/sla
 // your sheet fires but health's `lastTriggerAt` never updates, the POST is not
 // reaching this process (wrong tunnel URL, serve not running, or wrong secret).
 
-function startServer({ processOneOrder }) {
+function startServer({ processOneOrder, handleExternalOrder }) {
   console.log('Starting trigger server...------------------------>>>>>>>>>>>>>>>>>>>>>>>>>');
   const port = parseInt(process.env.TRIGGER_PORT || '8787', 10);
   const secret = process.env.TRIGGER_SECRET || '';
@@ -246,8 +246,49 @@ function startServer({ processOneOrder }) {
       return;
     }
 
+    // External API: POST /external/grubhub_ordering/<appointment_id>
+    // Idempotent start-or-report. Only active when the serve-external worker
+    // wired handleExternalOrder (headless pool + Redis). Auth via
+    // EXTERNAL_API_SECRET, falling back to TRIGGER_SECRET.
+    if (req.method === 'POST' && url.startsWith('/external/grubhub_ordering/')) {
+      if (!handleExternalOrder) {
+        res.writeHead(501, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'external API not enabled — start the worker with `serve-external`' }));
+        return;
+      }
+      const apiSecret = process.env.EXTERNAL_API_SECRET || secret;
+      const rawSecret = req.headers['x-api-secret'] || req.headers['x-trigger-secret'];
+      const provided = Array.isArray(rawSecret) ? (rawSecret[0] || '') : (rawSecret || '');
+      if (!apiSecret || provided !== apiSecret) {
+        res.writeHead(401, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+        logger.warn({ ip }, 'REJECTED /external/grubhub_ordering (bad/missing secret)');
+        return;
+      }
+      const rawId = url.slice('/external/grubhub_ordering/'.length).split('?')[0];
+      const appointmentId = decodeURIComponent(rawId || '').trim();
+      if (!appointmentId) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'missing appointment_id in path' }));
+        return;
+      }
+      try {
+        const result = await handleExternalOrder(appointmentId);
+        const statusCode = result && result.state === 'working' ? 202 : 200;
+        res.writeHead(statusCode, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, ...result }));
+        logger.info({ ip, appointmentId, state: result && result.state }, 'handled /external/grubhub_ordering');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error({ ip, appointmentId, err: msg }, '/external/grubhub_ordering failed');
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: msg }));
+      }
+      return;
+    }
+
     res.writeHead(404, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: false, error: 'not found', tip: 'POST /trigger, POST /slack/interactive, or GET /health' }));
+    res.end(JSON.stringify({ ok: false, error: 'not found', tip: 'POST /trigger, POST /slack/interactive, POST /external/grubhub_ordering/<id>, or GET /health' }));
   });
 
   server.listen(port, () => {

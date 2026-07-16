@@ -3,6 +3,8 @@ node_modules/
 .env.*
 secrets/
 chrome-profile/
+chrome-profile-*/
+screenshots/
 *.log
 dist/
 build/
@@ -11,3 +13,6 @@ build/
 # Local runtime / agent state (never commit)
 .bot-instance.lock
 .claude/
+
+# API capture output — contains live auth tokens, never commit
+api-capture/

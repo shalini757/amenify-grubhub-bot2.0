@@ -83,18 +83,35 @@ async function cmdCheck() {
   process.exit(allOk ? 0 : 1);
 }
 
-function cmdLogin() {
-  // Login is no longer handled by the bot. The bot drives the real Chrome you
-  // start with `npm run chrome`; sign in there once and the cookies persist in
-  // ./chrome-profile.
+async function cmdLogin(accountId) {
+  // With an account id: open that email's headless-pool profile HEADFUL so a
+  // human signs in once; the session persists in chrome-profile-<id>/ for the
+  // external API worker. Without one: the CDP path login stays manual.
+  if (!accountId) {
+    // eslint-disable-next-line no-console
+    console.log(
+      '\nCDP path login is manual, inside the real Chrome:\n' +
+        '  1. npm run chrome   (a Chrome window opens using ./chrome-profile)\n' +
+        '  2. Go to grubhub.com and sign in (handle any 2FA/captcha yourself)\n' +
+        '  3. Leave it signed in — the bot attaches to it over CDP.\n' +
+        '\nFor the external API pool, pass an account id/email:\n' +
+        '  node src/index.js login <email>\n',
+    );
+    process.exit(0);
+    return;
+  }
+  const browserPool = require('./grubhub/browserPool');
+  const context = await browserPool.loginContext(accountId);
+  const page = context.pages()[0] || (await context.newPage());
+  await page.goto('https://www.grubhub.com/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
   // eslint-disable-next-line no-console
   console.log(
-    '\nLogin is now manual, inside the real Chrome:\n' +
-      '  1. npm run chrome   (a Chrome window opens using ./chrome-profile)\n' +
-      '  2. Go to grubhub.com and sign in (handle any 2FA/captcha yourself)\n' +
-      '  3. Leave it signed in — the bot attaches to it over CDP.\n',
+    `\nA Chrome window opened for account "${accountId}".\n` +
+      '  1. Sign in to grubhub.com in that window (handle 2FA/captcha).\n' +
+      '  2. Leave it signed in, then press Ctrl+C here.\n' +
+      `The login persists in ${browserPool.profileDir(accountId)} for the API worker.\n`,
   );
-  process.exit(0);
+  await new Promise(() => {}); // keep alive until Ctrl+C so the human can sign in
 }
 
 async function cmdOrder() {
@@ -163,7 +180,25 @@ function mergeMenuApiItems(domItems, apiItems) {
   return Array.from(byName.values());
 }
 
-async function processOneOrder() {
+// Rows at/below this number are the "previous sheet" backlog present when the
+// worker started — skipped unless PROCESS_BACKLOG=true. Only rows added AFTER
+// startup count as new orders. 0 = no gate (one-shot `order` + the API path).
+let processOnlyAfterRow = 0;
+async function initNewOrderBaseline() {
+  try {
+    processOnlyAfterRow = await sheetClient.getMaxDataRow();
+    logger.info({ processOnlyAfterRow }, 'new-order baseline set — ignoring previous-sheet backlog (PROCESS_BACKLOG=true to override)');
+  } catch (err) {
+    logger.warn({ err: err.message }, 'could not set new-order baseline — proceeding without the gate');
+  }
+}
+
+// opts (all optional) drive the two execution paths without duplicating the
+// pipeline: {appointmentId} → look the order up by id (API path) instead of the
+// queue; {account} → use a specific email; {acquireBrowser(id)} → get a page
+// from the headless pool instead of the CDP attach; {keepBrowser} → don't tear
+// the browser down in finally (pooled contexts are reused).
+async function processOneOrder(opts = {}) {
   const DRY_RUN = (process.env.DRY_RUN || 'true').toLowerCase() === 'true';
   const CONFIDENCE_THRESHOLD = parseFloat(process.env.CONFIDENCE_THRESHOLD || '0.85');
   const MIN_AVG_CONFIDENCE = parseFloat(process.env.MIN_AVG_CONFIDENCE || '0.92');
@@ -181,34 +216,53 @@ async function processOneOrder() {
     // Pre-flight 1: don't lock a row if the debug Chrome isn't even up. Returns
     // code 3 (SESSION_EXPIRED handling) so the drain/run loop PAUSES 60s for the
     // human to start Chrome, instead of locking + failing the row.
-    const reach = await preflightChromeReachable();
-    if (!reach.ok) {
-      logger.warn(
-        { reason: reach.reason, cdpUrl: process.env.BROWSER_CDP_URL },
-        'PRE-FLIGHT: debug Chrome not reachable — pausing queue, NOT processing any row. Start it with `npm run chrome` and sign in.',
+    // CDP probe only matters for the attach-to-Chrome path; the headless pool
+    // (API path, opts.acquireBrowser) launches its own browser, so skip it.
+    if (!opts.acquireBrowser) {
+      const reach = await preflightChromeReachable();
+      if (!reach.ok) {
+        logger.warn(
+          { reason: reach.reason, cdpUrl: process.env.BROWSER_CDP_URL },
+          'PRE-FLIGHT: debug Chrome not reachable — pausing queue, NOT processing any row. Start it with `npm run chrome` and sign in.',
+        );
+        return 3;
+      }
+    }
+
+    let order;
+    if (opts.appointmentId != null) {
+      // API path: run one specific order located by appointment_id.
+      order = await sheetClient.getOrderById(opts.appointmentId);
+      if (!order) {
+        logger.warn({ appointmentId: opts.appointmentId }, 'no sheet row found for appointment_id');
+        return 2;
+      }
+      logger.info({ row: order._rowNumber, id: order.id }, 'processing order (by appointment_id)');
+    } else {
+      let orders = await sheetClient.getQueuedOrders();
+      // "Only new orders" gate: ignore the previous-sheet backlog present at
+      // startup, unless PROCESS_BACKLOG=true (used for batch testing).
+      if (processOnlyAfterRow > 0 && String(process.env.PROCESS_BACKLOG || '').toLowerCase() !== 'true') {
+        const before = orders.length;
+        orders = orders.filter((o) => o._rowNumber > processOnlyAfterRow);
+        if (before !== orders.length) {
+          logger.info({ ignoredBacklogRows: before - orders.length, processOnlyAfterRow }, 'skipped previous-sheet backlog rows — only acting on new orders');
+        }
+      }
+      logger.info({ count: orders.length, dryRun: DRY_RUN }, 'queued orders fetched');
+      if (!orders.length) {
+        // eslint-disable-next-line no-console
+        console.log('No queued orders to process.');
+        return 2;
+      }
+      // Process the NEWEST ready row (highest row number) so "add a row → that
+      // row runs" holds even with leftover duplicate rows in the sheet.
+      order = orders.slice().sort((a, b) => b._rowNumber - a._rowNumber)[0];
+      logger.info(
+        { row: order._rowNumber, id: order.id, readyCount: orders.length },
+        'processing order (newest ready row)',
       );
-      return 3;
     }
-
-    const orders = await sheetClient.getQueuedOrders();
-    logger.info({ count: orders.length, dryRun: DRY_RUN }, 'queued orders fetched');
-    if (!orders.length) {
-      // eslint-disable-next-line no-console
-      console.log('No queued orders to process.');
-      return 2;
-    }
-
-    // Process the NEWEST ready row (highest row number), not the oldest.
-    // getQueuedOrders returns rows top→bottom, so orders[0] was the oldest
-    // ready row — which, with the sheet's leftover duplicate rows, meant a
-    // brand-new row you just added would lose to an old still-"ready" duplicate
-    // (you'd get a Slack card for the PREVIOUS order). Picking the highest row
-    // makes "add a row → that row runs" hold.
-    const order = orders.slice().sort((a, b) => b._rowNumber - a._rowNumber)[0];
-    logger.info(
-      { row: order._rowNumber, id: order.id, readyCount: orders.length },
-      'processing order (newest ready row)',
-    );
 
     const parsed = parseNotes(order.notes);
     if (!parsed.isGrubhub || !parsed.orderUrl) {
@@ -292,8 +346,8 @@ async function processOneOrder() {
     // SESSION_EXPIRED → caught below → returns code 3 (pause). Because the row
     // isn't locked yet, lockedRow stays null, so the catch block does NOT mark
     // it failed — the row is left untouched and retried after you sign in.
-    const account = pickAccount('auto');
-    ctx = await launchContext(account.id);
+    const account = opts.account || pickAccount('auto');
+    ctx = opts.acquireBrowser ? await opts.acquireBrowser(account.id) : await launchContext(account.id);
     browser = ctx.browser;
 
     if (ctx.cdpAttached) {
@@ -1220,9 +1274,11 @@ async function processOneOrder() {
       await page.close().catch(() => {});
       logger.info('closed per-order tab');
     }
-    // CDP attach: just disconnect (browser.close() on a connectOverCDP
-    // handle won't kill the user's Chrome, but be explicit about intent).
-    if (browser) {
+    // The headless pool (API path, keepBrowser) reuses its persistent context
+    // across orders on the same email — only tear the browser down otherwise.
+    // CDP attach: browser.close() on a connectOverCDP handle won't kill the
+    // user's Chrome, but be explicit about intent.
+    if (browser && !opts.keepBrowser) {
       if (ctx && ctx.cdpAttached) {
         await browser.close().catch(() => {});
         logger.info('disconnected from user Chrome (CDP)');
@@ -1233,6 +1289,62 @@ async function processOneOrder() {
   }
 
   return exitCode;
+}
+
+// ---- External API path (Amenify /external/grubhub_ordering) ----
+// Run one order (located by appointment_id) on a pooled headless browser for a
+// specific email, under a hard timeout, reflecting the outcome into Redis
+// (completed | error). The email lock is always released.
+async function runApiOrder(appointmentId, account) {
+  const redisState = require('./state/redisState');
+  const emailPool = require('./accounts/emailPool');
+  const browserPool = require('./grubhub/browserPool');
+  const ORDER_TIMEOUT_MS = Math.max(60000, parseInt(process.env.ORDER_TIMEOUT_MS || '1200000', 10));
+
+  const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('ORDER_TIMEOUT')), ORDER_TIMEOUT_MS));
+  try {
+    const code = await Promise.race([
+      processOneOrder({
+        appointmentId,
+        account,
+        acquireBrowser: (id) => browserPool.acquireCtx(id),
+        keepBrowser: true,
+      }),
+      timeout,
+    ]);
+    await (code === 0 ? redisState.setCompleted(appointmentId) : redisState.setError(appointmentId));
+    logger.info({ appointmentId, code }, 'API order finished');
+  } catch (err) {
+    logger.error({ appointmentId, err: err.message }, 'API order errored/timed out');
+    await redisState.setError(appointmentId).catch(() => {});
+  } finally {
+    await emailPool.releaseEmail(account.id).catch(() => {});
+  }
+}
+
+// Idempotent start-or-report for POST /external/grubhub_ordering/<appointment_id>.
+// Returns { appointment_id, state } (working | completed | error | busy). Starts
+// a background run (fire-and-forget) only on the first call for that id.
+async function handleExternalOrder(appointmentId) {
+  const redisState = require('./state/redisState');
+  const emailPool = require('./accounts/emailPool');
+
+  const existing = await redisState.getState(appointmentId);
+  if (existing) return { appointment_id: appointmentId, state: existing };
+
+  // Atomic claim so two concurrent POSTs can't both start the same order.
+  const claimed = await redisState.claimWorking(appointmentId);
+  if (!claimed) {
+    const cur = await redisState.getState(appointmentId);
+    return { appointment_id: appointmentId, state: cur || redisState.STATES.WORKING };
+  }
+  const account = await emailPool.acquireEmail(appointmentId);
+  if (!account) {
+    await redisState.clearState(appointmentId); // release claim so a later retry can start
+    return { appointment_id: appointmentId, state: redisState.STATES.BUSY };
+  }
+  runApiOrder(appointmentId, account); // fire-and-forget; respond immediately
+  return { appointment_id: appointmentId, state: redisState.STATES.WORKING, email: account.id };
 }
 
 // Loop runner: process orders sequentially forever, sleeping POLL_INTERVAL_MS
@@ -1248,6 +1360,7 @@ async function processOneOrder() {
 async function cmdRun() {
   const pollMs = Math.max(5000, parseInt(process.env.POLL_INTERVAL_MS || '300000', 10));
   logger.info({ pollMs }, 'starting run loop (Ctrl+C to stop)');
+  await initNewOrderBaseline(); // only process orders added AFTER startup
   // eslint-disable-next-line no-constant-condition
   while (true) {
     const code = await processOneOrder().catch((err) => {
@@ -1273,8 +1386,20 @@ async function cmdServe() {
   // Lazy dynamic import: server.ts imports this module, so a top-level import
   // would create a circular import. Resolve it only when serve runs.
   const { startServer } = require('./server');
+  await initNewOrderBaseline(); // gate the fallback poll to new orders only
   await startServer({ processOneOrder });
   // Keep the process alive; startServer holds the HTTP listener open.
+}
+
+// External API worker: same HTTP server, but also serves
+// POST /external/grubhub_ordering/<appointment_id>, which runs orders
+// concurrently on the headless browser pool with Redis-backed state. WEBHOOK_ONLY
+// is forced on so the CDP fallback poll/drain doesn't also fire in this process.
+async function cmdServeExternal() {
+  process.env.WEBHOOK_ONLY = 'true';
+  const { startServer } = require('./server');
+  await initNewOrderBaseline();
+  await startServer({ processOneOrder, handleExternalOrder });
 }
 
 async function cmdQueueTest() {
@@ -1304,12 +1429,65 @@ async function cmdQueueTest() {
   process.exit(0);
 }
 
+// Bulk-append N test orders for load/robustness testing. Source of orders:
+//   TEST_BATCH_FILE = path to a JSON array of
+//     {store,url,items,maxTotal,address,phone,notes} objects; otherwise
+//   TEST_BATCH_COUNT (default 10) copies of the single queue-test default.
+async function cmdQueueTestBatch() {
+  const fs = require('fs');
+  let batch = [];
+  const file = process.env.TEST_BATCH_FILE;
+  if (file && fs.existsSync(file)) {
+    try {
+      batch = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (!Array.isArray(batch)) throw new Error('TEST_BATCH_FILE must be a JSON array');
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error(`Could not read TEST_BATCH_FILE: ${e.message}`);
+      process.exit(1);
+    }
+  } else {
+    const n = Math.max(1, parseInt(process.env.TEST_BATCH_COUNT || '10', 10));
+    batch = Array.from({ length: n }, () => ({}));
+  }
+
+  let ok = 0;
+  for (let i = 0; i < batch.length; i++) {
+    const o = batch[i] || {};
+    const url = o.url || process.env.TEST_URL || 'https://www.grubhub.com/restaurant/the-melt---925-market-sf-925-market-st-san-francisco/2028596';
+    const store = o.store || process.env.TEST_STORE || 'The Melt - 925 Market SF';
+    const items = o.items || process.env.TEST_ITEMS || 'The Classic x 1 ($8.49), Fries x 1 ($4.99)';
+    const maxTotal = o.maxTotal || process.env.TEST_MAX_TOTAL || '25.00';
+    const address = o.address || process.env.TEST_ADDRESS || '925 Market St, San Francisco, CA 94103, USA, Unit: 1';
+    const phone = o.phone || process.env.TEST_PHONE || '+15555550100';
+    const special = o.notes || process.env.TEST_NOTES || 'Batch test order';
+    const id = `test-${Date.now()}-${i}`;
+    const notes =
+      `Grubhub appointment\n\n` +
+      `Store: ${store}\n\n` +
+      `Order URL: ${url}\n\n` +
+      `Total: ${maxTotal}\n\n` +
+      `Items: ${items}\n\n` +
+      `Resident address: ${address}\n\n` +
+      `Temporary phone to use for booking: ${phone}\n\n` +
+      `Resident notes and Special Instructions: ${special}\n`;
+    // eslint-disable-next-line no-await-in-loop
+    const res = await sheetClient.appendOrder({ id, salePrice: maxTotal, notes });
+    if (res.rowNumber) ok += 1;
+    // eslint-disable-next-line no-console
+    console.log(`  [${i + 1}/${batch.length}] id=${id} row=${res.rowNumber || '?'}`);
+  }
+  // eslint-disable-next-line no-console
+  console.log(`Appended ${ok}/${batch.length} test orders to the sheet.`);
+  process.exit(0);
+}
+
 async function main() {
   const [, , cmd, ...rest] = process.argv;
   // Single-instance guard for any command that processes orders. Two bots
   // running at once would each have their own in-memory drain lock and could
   // work different sheet rows in parallel (the row-60/61 overlap).
-  const ORDER_COMMANDS = new Set(['order', 'run', 'serve']);
+  const ORDER_COMMANDS = new Set(['order', 'run', 'serve', 'serve-external']);
   if (ORDER_COMMANDS.has(cmd)) {
     require('./util/singleInstance').acquire(cmd);
   }
@@ -1317,18 +1495,22 @@ async function main() {
     case 'check':
       return cmdCheck();
     case 'login':
-      return cmdLogin();
+      return cmdLogin(rest[0]);
     case 'order':
       return cmdOrder();
     case 'run':
       return cmdRun();
     case 'serve':
       return cmdServe();
+    case 'serve-external':
+      return cmdServeExternal();
     case 'queue-test':
       return cmdQueueTest();
+    case 'queue-test-batch':
+      return cmdQueueTestBatch();
     default:
       // eslint-disable-next-line no-console
-      console.log('Commands:\n  check                  Verify Sheets, Claude, accounts, Slack\n  login <accountId>      Open a browser to save a Grubhub session\n  order                  Process one queued order then exit\n  run                    Loop: process queued orders forever (Ctrl+C to stop)\n  serve                  Webhook server: process instantly when a new row is added (+ fallback poll)\n  queue-test             Append a test order row to the Sheet (TEST_URL / TEST_ITEMS / TEST_MAX_TOTAL env overrides)');
+      console.log('Commands:\n  check                  Verify Sheets, Claude, accounts, Slack\n  login <accountId>      Sign into a per-email pool profile (or CDP path if no id)\n  order                  Process one queued order then exit\n  run                    Loop: process queued orders forever (Ctrl+C to stop)\n  serve                  Webhook server: process instantly when a new row is added (+ fallback poll)\n  serve-external         API worker: POST /external/grubhub_ordering/<id> (Redis + headless pool, concurrent)\n  queue-test             Append a test order row to the Sheet (TEST_URL / TEST_ITEMS / TEST_MAX_TOTAL env overrides)\n  queue-test-batch       Append many test orders (TEST_BATCH_FILE json array, or TEST_BATCH_COUNT copies)');
       process.exit(0);
   }
 }
